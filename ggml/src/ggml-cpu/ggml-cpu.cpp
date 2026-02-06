@@ -37,6 +37,32 @@
 #    include <sys/types.h>
 #endif
 
+// #define USE_PERF
+#if defined(USE_PERF)
+// https://learn.arm.com/learning-paths/servers-and-cloud-computing/arm_pmu/perf_event_open/
+#include <linux/perf_event.h> /* Definition of PERF_* constants */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h> /* Definition of SYS_* constants */
+#include <unistd.h>
+#include <inttypes.h>
+#include "arm_pmuv3.h"
+
+// Executes perf_event_open syscall and makes sure it is succesful or exit
+static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid, int cpu, int group_fd, unsigned long flags){
+  int fd;
+  fd = syscall(SYS_perf_event_open, hw_event, pid, cpu, group_fd, flags);
+  if (fd == -1) {
+    fprintf(stderr, "Error creating event");
+    exit(EXIT_FAILURE);
+  }
+
+  return fd;
+}
+#endif
+
 // ggml-backend interface
 
 std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_types() {
@@ -183,7 +209,98 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
 
-    return ggml_graph_compute(cgraph, &cplan);
+#if defined(USE_PERF)
+    struct perf_event_attr pe0, pe1, pe2, pe3, pe4, pe5, pe6;
+    int fd0, fd1, fd2, fd3, fd4, fd5, fd6;
+
+    memset(&pe0, 0, sizeof(struct perf_event_attr));
+    pe0.type = PERF_TYPE_RAW; pe0.size = sizeof(struct perf_event_attr);
+    pe0.disabled = 1; pe0.exclude_kernel = 1; pe0.exclude_hv = 1;
+
+    memset(&pe1, 0, sizeof(struct perf_event_attr));
+    pe1.type = PERF_TYPE_RAW; pe1.size = sizeof(struct perf_event_attr);
+    pe1.disabled = 1; pe1.exclude_kernel = 1; pe1.exclude_hv = 1;
+
+    memset(&pe2, 0, sizeof(struct perf_event_attr));
+    pe2.type = PERF_TYPE_RAW; pe2.size = sizeof(struct perf_event_attr);
+    pe2.disabled = 1; pe2.exclude_kernel = 1; pe2.exclude_hv = 1;
+
+    memset(&pe3, 0, sizeof(struct perf_event_attr));
+    pe3.type = PERF_TYPE_RAW; pe3.size = sizeof(struct perf_event_attr);
+    pe3.disabled = 1; pe3.exclude_kernel = 1; pe3.exclude_hv = 1;
+
+    memset(&pe4, 0, sizeof(struct perf_event_attr));
+    pe4.type = PERF_TYPE_RAW; pe4.size = sizeof(struct perf_event_attr);
+    pe4.disabled = 1; pe4.exclude_kernel = 1; pe4.exclude_hv = 1;
+
+    memset(&pe5, 0, sizeof(struct perf_event_attr));
+    pe5.type = PERF_TYPE_RAW; pe5.size = sizeof(struct perf_event_attr);
+    pe5.disabled = 1; pe5.exclude_kernel = 1; pe5.exclude_hv = 1;
+
+    memset(&pe6, 0, sizeof(struct perf_event_attr));
+    pe6.type = PERF_TYPE_RAW; pe6.size = sizeof(struct perf_event_attr);
+    pe6.disabled = 1; pe6.exclude_kernel = 1; pe6.exclude_hv = 1;
+
+    pe0.config = ARMV8_PMUV3_PERFCTR_INST_RETIRED;
+    // for microarchitecture-dependent
+    // 1. backend_stalled_cycles
+    // 2. backend_stalled_mem
+    // 3. L1D Cache MPKI
+    // 4. L2 Cache MPKI
+    // 5. LL Cache Read MPKI
+    pe1.config = ARMV8_PMUV3_PERFCTR_CPU_CYCLES;
+    pe2.config = ARMV8_PMUV3_PERFCTR_STALL_BACKEND;
+    pe3.config = ARMV8_AMU_PERFCTR_STALL_BACKEND_MEM;
+    pe4.config = ARMV8_PMUV3_PERFCTR_L1D_CACHE_REFILL;
+    pe5.config = ARMV8_PMUV3_PERFCTR_L2D_CACHE_REFILL;
+    pe6.config = ARMV8_PMUV3_PERFCTR_LL_CACHE_MISS_RD;
+
+    // Create the events
+    fd0 = perf_event_open(&pe0, 0, -1, -1, 0);
+    fd1 = perf_event_open(&pe1, 0, -1, -1, 0);
+    fd2 = perf_event_open(&pe2, 0, -1, -1, 0);
+    fd3 = perf_event_open(&pe3, 0, -1, -1, 0);
+    fd4 = perf_event_open(&pe4, 0, -1, -1, 0);
+    fd5 = perf_event_open(&pe5, 0, -1, -1, 0);
+    fd6 = perf_event_open(&pe6, 0, -1, -1, 0);
+    //Reset counters and start counting
+    ioctl(fd0, PERF_EVENT_IOC_RESET, 0); ioctl(fd0, PERF_EVENT_IOC_ENABLE, 0);
+    ioctl(fd1, PERF_EVENT_IOC_RESET, 0); ioctl(fd1, PERF_EVENT_IOC_ENABLE, 0);
+    ioctl(fd2, PERF_EVENT_IOC_RESET, 0); ioctl(fd2, PERF_EVENT_IOC_ENABLE, 0);
+    ioctl(fd3, PERF_EVENT_IOC_RESET, 0); ioctl(fd3, PERF_EVENT_IOC_ENABLE, 0);
+    ioctl(fd4, PERF_EVENT_IOC_RESET, 0); ioctl(fd4, PERF_EVENT_IOC_ENABLE, 0);
+    ioctl(fd5, PERF_EVENT_IOC_RESET, 0); ioctl(fd5, PERF_EVENT_IOC_ENABLE, 0);
+    ioctl(fd6, PERF_EVENT_IOC_RESET, 0); ioctl(fd6, PERF_EVENT_IOC_ENABLE, 0);
+#endif
+    enum ggml_status ok = ggml_graph_compute(cgraph, &cplan);
+#if defined(USE_PERF)
+    // Stop counting
+    ioctl(fd0, PERF_EVENT_IOC_DISABLE, 0);
+    ioctl(fd1, PERF_EVENT_IOC_DISABLE, 0);
+    ioctl(fd2, PERF_EVENT_IOC_DISABLE, 0);
+    ioctl(fd3, PERF_EVENT_IOC_DISABLE, 0);
+    ioctl(fd4, PERF_EVENT_IOC_DISABLE, 0);
+    ioctl(fd5, PERF_EVENT_IOC_DISABLE, 0);
+    ioctl(fd6, PERF_EVENT_IOC_DISABLE, 0);
+    // Read and print result
+    uint64_t count[7];
+    read(fd0, &count[0], sizeof(count[0]));
+    read(fd1, &count[1], sizeof(count[1]));
+    read(fd2, &count[2], sizeof(count[2]));
+    read(fd3, &count[3], sizeof(count[3]));
+    read(fd4, &count[4], sizeof(count[4]));
+    read(fd5, &count[5], sizeof(count[5]));
+    read(fd6, &count[6], sizeof(count[6]));
+    // Clean up file descriptor
+    close(fd0); close(fd1); close(fd2); close(fd3); close(fd4); close(fd5); close(fd6);
+    GGML_LOG_INFO("\tinsn= %lu; cyc= %lu\n", count[0], count[1]);
+    GGML_LOG_INFO("\tbackend_stalled_cycles= %f%%\n", count[2]*1.0/count[1]*100);
+    GGML_LOG_INFO("\tbackend_stalled_mem= %f%%\n", count[3]*1.0/count[1]*100);
+    GGML_LOG_INFO("\tL1D Cache MPKI= %f\n", count[4]*1.0/count[0]*1000);
+    GGML_LOG_INFO("\tL2  Cache MPKI= %f\n", count[5]*1.0/count[0]*1000);
+    GGML_LOG_INFO("\tLL  Cache Read MPKI= %f\n", count[6]*1.0/count[0]*1000);
+#endif
+    return ok;
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {

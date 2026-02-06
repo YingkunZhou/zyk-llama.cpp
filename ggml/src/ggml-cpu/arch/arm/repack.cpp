@@ -47,6 +47,141 @@ static inline void decode_q4_Kx8_scales_mins(const uint8_t * scales_in,
     scales_u32[1] = (sm[2] & kmask2) | (((sm[0] >> 6) & kmask3) << 4);
     memcpy(out_scales, scales_u32, 8);
 }
+
+#include "iqk_common.h"
+
+struct Q4_0_R8_Dequantizer {
+    Q4_0_R8_Dequantizer(const void * vx, size_t bx) : cx((const char *)vx), bx(bx) {}
+    inline void new_row(int ix) { iq4 = (const block_q4_0x8 *)(cx + ix*bx); }
+    inline float32x4x2_t prepare(int ib4, int k, int8x16_t * qx) const {
+        auto scales16 = vld1q_f16((const float16_t *)iq4[4*ib4+k].d);
+        float32x4x2_t scales = { vcvt_f32_f16(vget_low_f16(scales16)), vcvt_f32_f16(vget_high_f16(scales16)) };
+        for (int j = 0; j < 4; ++j) {
+            auto bits = vld1q_s8_x2(iq4[4*ib4+k].qs + 32*j);
+            qx[2*j+0] = bits.val[0] << 4;
+            qx[2*j+1] = bits.val[0] & 0xf0U;
+            qx[2*j+8] = bits.val[1] << 4;
+            qx[2*j+9] = bits.val[1] & 0xf0U;
+        }
+        return scales;
+    }
+    inline float32x4_t result(float32x4_t acc) const {
+        return vmulq_f32(norm, acc);
+    }
+
+    const char * cx;
+    const size_t bx;
+    const block_q4_0x8 * iq4;
+    const float32x4_t norm = vdupq_n_f32(1.f/16);
+};
+
+static IQK_ALWAYS_INLINE int32x4_t interleaved_dotq(const int8x16_t * qx, const int8x16x2_t& y) {
+    auto sumi = vdupq_n_s32(0);
+    sumi = vdotq_laneq_s32(sumi, qx[0], y.val[0], 0);
+    sumi = vdotq_laneq_s32(sumi, qx[1], y.val[1], 0);
+    sumi = vdotq_laneq_s32(sumi, qx[2], y.val[0], 1);
+    sumi = vdotq_laneq_s32(sumi, qx[3], y.val[1], 1);
+    sumi = vdotq_laneq_s32(sumi, qx[4], y.val[0], 2);
+    sumi = vdotq_laneq_s32(sumi, qx[5], y.val[1], 2);
+    sumi = vdotq_laneq_s32(sumi, qx[6], y.val[0], 3);
+    sumi = vdotq_laneq_s32(sumi, qx[7], y.val[1], 3);
+    return sumi;
+}
+
+template <int nrc_y>
+void mul_mat_qx_r8_q8_0(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    GGML_ASSERT(nrc_x%8 == 0);
+    const block_q8_0_x4 * q8[nrc_y];
+    for (int iy = 0; iy < nrc_y; ++iy) q8[iy] = (const block_q8_0_x4 *)info.src1_row(iy);
+    Q4_0_R8_Dequantizer deq(vx, bx);
+    int nb = n / QK4_NL;
+    int stride_y_block = nb * sizeof(block_q8_0);
+    int8x16_t qx[16];
+    float32x4_t d8[nrc_y];
+    const int8_t* q8qs[nrc_y];
+    for (int ix = 0; ix < nrc_x; ix += 8) {
+        float32x4_t acc[2*nrc_y] = {};
+        deq.new_row(ix);
+        for (int ib4 = 0; ib4 < nb/4; ++ib4) {
+            q8qs[0] = q8[0][ib4].qs;
+            for (int iy = 1; iy < nrc_y; ++iy) {
+                q8qs[iy] = q8qs[iy-1]+stride_y_block;
+            }
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                d8[iy] = vcvt_f32_f16(vld1_f16((const float16_t *)(q8qs[iy] - 8)));
+            }
+            auto scales0 = deq.prepare(ib4, 0, qx);
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto y = vld1q_s8_x2(q8qs[iy]);
+                auto sumi0 = interleaved_dotq(qx+0, y);
+                auto sumi1 = interleaved_dotq(qx+8, y);
+                float32x4_t scale0 = vmulq_laneq_f32(scales0.val[0], d8[iy], 0);
+                float32x4_t scale1 = vmulq_laneq_f32(scales0.val[1], d8[iy], 0);
+                acc[2*iy+0] = vfmaq_f32(acc[2*iy+0], scale0, vcvtq_f32_s32(sumi0));
+                acc[2*iy+1] = vfmaq_f32(acc[2*iy+1], scale1, vcvtq_f32_s32(sumi1));
+            }
+
+            auto scales1 = deq.prepare(ib4, 1, qx);
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto y = vld1q_s8_x2(q8qs[iy]+32);
+                auto sumi0 = interleaved_dotq(qx+0, y);
+                auto sumi1 = interleaved_dotq(qx+8, y);
+                float32x4_t scale0 = vmulq_laneq_f32(scales1.val[0], d8[iy], 1);
+                float32x4_t scale1 = vmulq_laneq_f32(scales1.val[1], d8[iy], 1);
+                acc[2*iy+0] = vfmaq_f32(acc[2*iy+0], scale0, vcvtq_f32_s32(sumi0));
+                acc[2*iy+1] = vfmaq_f32(acc[2*iy+1], scale1, vcvtq_f32_s32(sumi1));
+            }
+
+            auto scales2 = deq.prepare(ib4, 2, qx);
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto y = vld1q_s8_x2(q8qs[iy]+64);
+                auto sumi0 = interleaved_dotq(qx+0, y);
+                auto sumi1 = interleaved_dotq(qx+8, y);
+                float32x4_t scale0 = vmulq_laneq_f32(scales2.val[0], d8[iy], 2);
+                float32x4_t scale1 = vmulq_laneq_f32(scales2.val[1], d8[iy], 2);
+                acc[2*iy+0] = vfmaq_f32(acc[2*iy+0], scale0, vcvtq_f32_s32(sumi0));
+                acc[2*iy+1] = vfmaq_f32(acc[2*iy+1], scale1, vcvtq_f32_s32(sumi1));
+            }
+
+            auto scales3 = deq.prepare(ib4, 3, qx);
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto y = vld1q_s8_x2(q8qs[iy]+96);
+                auto sumi0 = interleaved_dotq(qx+0, y);
+                auto sumi1 = interleaved_dotq(qx+8, y);
+                float32x4_t scale0 = vmulq_laneq_f32(scales3.val[0], d8[iy], 3);
+                float32x4_t scale1 = vmulq_laneq_f32(scales3.val[1], d8[iy], 3);
+                acc[2*iy+0] = vfmaq_f32(acc[2*iy+0], scale0, vcvtq_f32_s32(sumi0));
+                acc[2*iy+1] = vfmaq_f32(acc[2*iy+1], scale1, vcvtq_f32_s32(sumi1));
+            }
+        }
+        for (int ib = 4*(nb/4); ib < nb; ++ib) {
+            auto scales = deq.prepare(ib, 0, qx);
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto qy = (const block_q8_0 *)q8[iy];
+                auto y = vld1q_s8_x2(qy[ib].qs);
+                auto sumi1 = interleaved_dotq(qx+0, y);
+                auto sumi2 = interleaved_dotq(qx+8, y);
+                auto dy = vdupq_n_f32(GGML_FP16_TO_FP32(qy[ib].d));
+                acc[2*iy+0] = vfmaq_f32(acc[2*iy+0], vmulq_f32(scales.val[0], dy), vcvtq_f32_s32(sumi1));
+                acc[2*iy+1] = vfmaq_f32(acc[2*iy+1], vmulq_f32(scales.val[1], dy), vcvtq_f32_s32(sumi2));
+            }
+        }
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            info.store(ix+0, iy, deq.result(acc[2*iy+0]));
+            info.store(ix+4, iy, deq.result(acc[2*iy+1]));
+        }
+    }
+}
+
+std::array<mul_mat_t, IQK_MAX_NY> q4_0_funcs = {
+    mul_mat_qx_r8_q8_0<1>,
+    mul_mat_qx_r8_q8_0<2>,
+    mul_mat_qx_r8_q8_0<3>,
+    mul_mat_qx_r8_q8_0<4>,
+    mul_mat_qx_r8_q8_0<5>,
+    mul_mat_qx_r8_q8_0<6>,
+    mul_mat_qx_r8_q8_0<7>,
+    mul_mat_qx_r8_q8_0<8>};
 #endif
 
 void ggml_quantize_mat_q8_0_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
@@ -934,6 +1069,7 @@ void ggml_gemm_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     UNUSED(blocklen);
 
 #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if 0
     const void * b_ptr = vx;
     const void * a_ptr = vy;
     float * res_ptr = s;
@@ -1389,6 +1525,529 @@ void ggml_gemm_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         : [b_ptr] "r" (b_ptr), [nr] "r" (nr), [nb] "r" (nb), [res_stride] "r" (res_stride), [nc] "r" (nc)
         : "cc", "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "x9", "x10", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"
     );
+#elif 1
+    const block_q4_0x4 * GGML_RESTRICT b_ptr = (const block_q4_0x4 *)vx;
+    const block_q8_0x4 * GGML_RESTRICT a_ptr = (const block_q8_0x4 *)vy;
+    float * GGML_RESTRICT res_ptr = s;
+    size_t res_stride = bs;
+
+    int nr_remaining = nr; // "mov x10, %x[nr]\n"
+    int stride_a_block = nb * sizeof(block_q8_0x4); // "mov x9, #0x88\n", "mul x9, %x[nb], x9\n"
+
+    while (nr_remaining >= 0x10) { // "cmp x10, #0x10\n", "blt 4f\n" | // "cmp x10, #0x10\n", "bge 1b\n"
+        // "1:"  // Row loop | Main loop: Process 16 rows at a time
+        // Setup row loop pointers
+        // b_ptr stays at the current column block base for these 16 rows
+        const int8_t *b_qs_base = (const int8_t *)(b_ptr->qs); // "add x28, %x[b_ptr], #0x8\n"
+        int nc_remaining = nc; // "mov x27, %x[nc]\n"
+        float *res_ptr_next_16 = res_ptr + (res_stride << 4); // "add x26, %x[res_ptr], %x[res_stride], LSL #4\n"
+
+        do { // "2:"  // Column loop | Column loop: Process 4 columns at a time (1 block_q4_0x4)
+            // Block loop (nb): iterate over the dimension K
+            int k = nb; // "mov x24, %x[nb]\n"
+            // Initialize accumulators for 16 rows x 4 columns result
+            float32x4_t facc0  = vdupq_n_f32(0.0f); // "movi v15.16b, #0x0\n"
+            float32x4_t facc1  = vdupq_n_f32(0.0f); // "movi v19.16b, #0x0\n"
+            float32x4_t facc2  = vdupq_n_f32(0.0f); // "movi v18.16b, #0x0\n"
+            float32x4_t facc3  = vdupq_n_f32(0.0f); // "movi v14.16b, #0x0\n"
+            float32x4_t facc4  = vdupq_n_f32(0.0f); // "movi v11.16b, #0x0\n"
+            float32x4_t facc5  = vdupq_n_f32(0.0f); // "movi v13.16b, #0x0\n"
+            float32x4_t facc6  = vdupq_n_f32(0.0f); // "movi v23.16b, #0x0\n"
+            float32x4_t facc7  = vdupq_n_f32(0.0f); // "movi v16.16b, #0x0\n"
+            float32x4_t facc8  = vdupq_n_f32(0.0f); // "movi v25.16b, #0x0\n"
+            float32x4_t facc9  = vdupq_n_f32(0.0f); // "movi v7.16b, #0x0\n"
+            float32x4_t facc10 = vdupq_n_f32(0.0f); // "movi v0.16b, #0x0\n"
+            float32x4_t facc11 = vdupq_n_f32(0.0f); // "movi v4.16b, #0x0\n"
+            float32x4_t facc12 = vdupq_n_f32(0.0f); // "movi v5.16b, #0x0\n"
+            float32x4_t facc13 = vdupq_n_f32(0.0f); // "movi v21.16b, #0x0\n"
+            float32x4_t facc14 = vdupq_n_f32(0.0f); // "movi v8.16b, #0x0\n"
+            float32x4_t facc15 = vdupq_n_f32(0.0f); // "movi v1.16b, #0x0\n"
+            // a_ptr points to the start of the row blocks. We need to handle 16 rows.
+            const int8_t * a_qs_base0 = a_ptr->qs; // "add x25, %x[a_ptr], #0x8\n"
+            const int8_t * a_qs_base1 = a_qs_base0 + stride_a_block; // "add x23, x25, x9\n"
+            const int8_t * a_qs_base2 = a_qs_base1 + stride_a_block; // "add x22, x23, x9\n"
+            const int8_t * a_qs_base3 = a_qs_base2 + stride_a_block; // "add x21, x22, x9\n"
+            do { // "3:"  // Block loop
+                k--; // "subs x24, x24, #0x1\n"
+                // --- Load Q4_0 Block (B) ---
+                // B has 4 interleaved columns in qs[0]..qs[3]. Each is 16 bytes (32 4-bit values).
+                int8x16_t b_qs_0 = vld1q_s8(b_qs_base); // "ldr q3, [x28, #0x0]\n"
+                int8x16_t b_qs_1 = vld1q_s8(b_qs_base + 0x10); // "ldr q22, [x28, #0x10]\n"
+                int8x16_t b_qs_2 = vld1q_s8(b_qs_base + 0x20); // "ldr q27, [x28, #0x20]\n"
+                int8x16_t b_qs_3 = vld1q_s8(b_qs_base + 0x30); // "ldr q30, [x28, #0x30]\n"
+                // Load Q4_0 scales (d) for this block
+                // x20 = x28 - 8 -> pointer to b_ptr->d
+                float16x4_t b_d_f16 = vld1_f16((const float16_t *)(b_qs_base - 8)); // "sub x20, x28, #0x8\n", "ldr d17, [x20, #0x0]\n"
+                float32x4_t b_d  = vcvt_f32_f16(b_d_f16);  // "fcvtl v17.4s, v17.4h\n"
+                b_qs_base += sizeof(block_q4_0x4); // "add x28, x28, #0x48\n"
+                // Unpack Q4_0 qs[0] (b_qs_0)
+                // (low nibbles shifted)
+                int8x16_t b_qs_0_low = b_qs_0 << 4; // "sshl v12.16b, v3.16b, v28.16b\n"
+                int8x16_t b_qs_1_low = b_qs_1 << 4; // "sshl v31.16b, v22.16b, v28.16b\n"
+                int8x16_t b_qs_2_low = b_qs_2 << 4; // "sshl v6.16b, v27.16b, v28.16b\n"
+                int8x16_t b_qs_3_low = b_qs_3 << 4; // "sshl v28.16b, v30.16b, v28.16b\n"
+                // (high nibbles)
+                int8x16_t b_qs_0_high = b_qs_0 & 0xf0U; // "and v3.16b, v3.16b, v24.16b\n"
+                int8x16_t b_qs_1_high = b_qs_1 & 0xf0U; // "and v22.16b, v22.16b, v24.16b\n"
+                int8x16_t b_qs_2_high = b_qs_2 & 0xf0U; // "and v27.16b, v27.16b, v24.16b\n"
+                int8x16_t b_qs_3_high = b_qs_3 & 0xf0U; // "and v30.16b, v30.16b, v24.16b\n"
+
+                // --- Q8_0 Rows 0-3 (a_ptr0) ---
+                int8x16_t a_qs_0 = vld1q_s8(a_qs_base0); // "ldr q31, [x25, #0x0]\n"
+                int8x16_t a_qs_1 = vld1q_s8(a_qs_base0 + 0x10); // "ldr q6,  [x25, #0x10]\n"
+                int8x16_t a_qs_2 = vld1q_s8(a_qs_base0 + 0x20); // "ldr q24, [x25, #0x20]\n"
+                int8x16_t a_qs_3 = vld1q_s8(a_qs_base0 + 0x30); // "ldr q24, [x25, #0x30]\n"
+                int8x16_t a_qs_4 = vld1q_s8(a_qs_base0 + 0x40); // "ldr q24, [x25, #0x40]\n"
+                int8x16_t a_qs_5 = vld1q_s8(a_qs_base0 + 0x50); // "ldr q24, [x25, #0x50]\n"
+                int8x16_t a_qs_6 = vld1q_s8(a_qs_base0 + 0x60); // "ldr q24, [x25, #0x60]\n"
+                int8x16_t a_qs_7 = vld1q_s8(a_qs_base0 + 0x70); // "ldr q24, [x25, #0x70]\n"
+                float16x4_t a0_d_f16 = vld1_f16((const float16_t *)(a_qs_base0 - 8)); // "ldr d2, [x25, #-0x8]\n"
+                float32x4_t a0_d = vcvt_f32_f16(a0_d_f16); // "fcvtl v2.4s, v2.4h\n"
+                a_qs_base0 += sizeof(block_q8_0x4); // "add x25, x25, #0x88\n"
+
+                // int8x16_t v28_const = vdupq_n_s8(4); // "movi v28.16b, #0x4\n"
+                // --- Compute Row Group 0 (Rows 0-3) ---
+                int32x4_t iacc0 = vdupq_n_s32(0); // "movi v10.4s, #0x0\n"
+                int32x4_t iacc1 = vdupq_n_s32(0); // "movi v29.4s, #0x0\n"
+                int32x4_t iacc2 = vdupq_n_s32(0); // "movi v9.4s, #0x0\n"
+                int32x4_t iacc3 = vdupq_n_s32(0); // "movi v20.4s, #0x0\n"
+
+                // Dot products for qs[0] of B with qs[0..3] of A (Row 0)
+                // Using b_qs_0_low
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_low, a_qs_0, 0); // sdot v10.4s, v12.16b, v31.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_low, a_qs_0, 1); // sdot v29.4s, v12.16b, v31.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_low, a_qs_0, 2); // sdot v9.4s,  v12.16b, v31.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_low, a_qs_0, 3); // sdot v20.4s, v12.16b, v31.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_low, a_qs_1, 0); // sdot v10.4s, v31.16b, v6.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_low, a_qs_1, 1); // sdot v29.4s, v31.16b, v6.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_low, a_qs_1, 2); // sdot v9.4s,  v31.16b, v6.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_low, a_qs_1, 3); // sdot v20.4s, v31.16b, v6.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_low, a_qs_2, 0); // sdot v10.4s, v6.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_low, a_qs_2, 1); // sdot v29.4s, v6.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_low, a_qs_2, 2); // sdot v9.4s,  v6.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_low, a_qs_2, 3); // sdot v20.4s, v6.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_low, a_qs_3, 0); // sdot v10.4s, v28.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_low, a_qs_3, 1); // sdot v29.4s, v28.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_low, a_qs_3, 2); // sdot v9.4s,  v28.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_low, a_qs_3, 3); // sdot v20.4s, v28.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_high, a_qs_4, 0); // sdot v10.4s, v3.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_high, a_qs_4, 1); // sdot v29.4s, v3.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_high, a_qs_4, 2); // sdot v9.4s,  v3.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_high, a_qs_4, 3); // sdot v20.4s, v3.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_high, a_qs_5, 0); // sdot v10.4s, v22.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_high, a_qs_5, 1); // sdot v29.4s, v22.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_high, a_qs_5, 2); // sdot v9.4s,  v22.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_high, a_qs_5, 3); // sdot v20.4s, v22.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_high, a_qs_6, 0); // sdot v10.4s, v27.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_high, a_qs_6, 1); // sdot v29.4s, v27.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_high, a_qs_6, 2); // sdot v9.4s,  v27.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_high, a_qs_6, 3); // sdot v20.4s, v27.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_high, a_qs_7, 0); // sdot v10.4s, v30.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_high, a_qs_7, 1); // sdot v29.4s, v30.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_high, a_qs_7, 2); // sdot v9.4s,  v30.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_high, a_qs_7, 3); // sdot v20.4s, v30.16b, v24.4b[3]\n"
+
+                // fmul v24 (scale), scvtf, fmla
+                float32x4_t scale_0 = vmulq_laneq_f32(b_d, a0_d, 0); // "fmul v24.4s, v17.4s, v2.s[0]\n"
+                float32x4_t scale_1 = vmulq_laneq_f32(b_d, a0_d, 1); // "fmul v10.4s, v17.4s, v2.s[1]\n"
+                float32x4_t scale_2 = vmulq_laneq_f32(b_d, a0_d, 2); // "fmul v29.4s, v17.4s, v2.s[2]\n"
+                float32x4_t scale_3 = vmulq_laneq_f32(b_d, a0_d, 3); // "fmul v2.4s, v17.4s, v2.s[3]\n"
+                facc0 = vfmaq_f32(facc0, vcvtq_n_f32_s32(iacc0, 4), scale_0); // "scvtf v10.4s, v10.4s, #0x4\n", "fmla v15.4s, v10.4s, v24.4s\n"
+                facc1 = vfmaq_f32(facc1, vcvtq_n_f32_s32(iacc1, 4), scale_1); // "scvtf v29.4s, v29.4s, #0x4\n", "fmla v19.4s, v29.4s, v10.4s\n"
+                facc2 = vfmaq_f32(facc2, vcvtq_n_f32_s32(iacc2, 4), scale_2); // "fmla v18.4s, v9.4s, v29.4s\n"
+                facc3 = vfmaq_f32(facc3, vcvtq_n_f32_s32(iacc3, 4), scale_3); // "scvtf v20.4s, v20.4s, #0x4\n", "fmla v14.4s, v20.4s, v2.4s\n"
+
+                a_qs_0 = vld1q_s8(a_qs_base1); // "ldr q24, [x23, #0x0]\n"
+                a_qs_1 = vld1q_s8(a_qs_base1 + 0x10); // "ldr q10, [x23, #0x10]\n"
+                a_qs_2 = vld1q_s8(a_qs_base1 + 0x20); // "ldr q24, [x23, #0x20]\n"
+                a_qs_3 = vld1q_s8(a_qs_base1 + 0x30); // "ldr q10, [x23, #0x30]\n"
+                a_qs_4 = vld1q_s8(a_qs_base1 + 0x40); // "ldr q24, [x23, #0x40]\n"
+                a_qs_5 = vld1q_s8(a_qs_base1 + 0x50); // "ldr q10, [x23, #0x50]\n"
+                a_qs_6 = vld1q_s8(a_qs_base1 + 0x60); // "ldr q24, [x23, #0x60]\n"
+                a_qs_7 = vld1q_s8(a_qs_base1 + 0x70); // "ldr q10, [x23, #0x70]\n"
+                float16x4_t a1_d_f16 = vld1_f16((const float16_t *)(a_qs_base1 - 8)); // "ldr d26, [x23, #-0x8]\n"
+                float32x4_t a1_d = vcvt_f32_f16(a1_d_f16); // "fcvtl v26.4s, v26.4h\n"
+                a_qs_base1 += sizeof(block_q8_0x4); // "add x23, x23, #0x88\n"
+                // --- Compute Row Group 1 (Rows 4-7) ---
+                // Accs: v9, v29, v20, v2 (Renamed to keep flow, but logically distinct)
+                // Reset v9, v29, v20, v2
+                iacc0 = vdupq_n_s32(0); // "movi v9.4s, #0x0\n"
+                iacc1 = vdupq_n_s32(0); // "movi v29.4s, #0x0\n"
+                iacc2 = vdupq_n_s32(0); // "movi v20.4s, #0x0\n"
+                iacc3 = vdupq_n_s32(0); // "movi v2.4s, #0x0\n"
+
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_low, a_qs_0, 0); // sdot v9.4s, v12.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_low, a_qs_0, 1); // sdot v29.4s, v12.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_low, a_qs_0, 2); // sdot v20.4s, v12.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_low, a_qs_0, 3); // sdot v2.4s, v12.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_low, a_qs_1, 0); // sdot v9.4s, v31.16b, v10.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_low, a_qs_1, 1); // sdot v29.4s, v31.16b, v10.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_low, a_qs_1, 2); // sdot v20.4s, v31.16b, v10.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_low, a_qs_1, 3); // sdot v2.4s, v31.16b, v10.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_low, a_qs_2, 0); // sdot v9.4s, v6.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_low, a_qs_2, 1); // sdot v29.4s, v6.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_low, a_qs_2, 2); // sdot v20.4s, v6.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_low, a_qs_2, 3); // sdot v2.4s, v6.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_low, a_qs_3, 0); // sdot v9.4s, v28.16b, v10.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_low, a_qs_3, 1); // sdot v29.4s, v28.16b, v10.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_low, a_qs_3, 2); // sdot v20.4s, v28.16b, v10.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_low, a_qs_3, 3); // sdot v2.4s, v28.16b, v10.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_high, a_qs_4, 0); // sdot v9.4s, v3.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_high, a_qs_4, 1); // sdot v29.4s, v3.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_high, a_qs_4, 2); // sdot v20.4s, v3.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_high, a_qs_4, 3); // sdot v2.4s, v3.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_high, a_qs_5, 0); // sdot v9.4s, v22.16b, v10.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_high, a_qs_5, 1); // sdot v29.4s, v22.16b, v10.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_high, a_qs_5, 2); // sdot v20.4s, v22.16b, v10.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_high, a_qs_5, 3); // sdot v2.4s, v22.16b, v10.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_high, a_qs_6, 0); // sdot v9.4s, v27.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_high, a_qs_6, 1); // sdot v29.4s, v27.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_high, a_qs_6, 2); // sdot v20.4s, v27.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_high, a_qs_6, 3); // sdot v2.4s, v27.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_high, a_qs_7, 0); // sdot v9.4s, v30.16b, v10.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_high, a_qs_7, 1); // sdot v29.4s, v30.16b, v10.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_high, a_qs_7, 2); // sdot v20.4s, v30.16b, v10.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_high, a_qs_7, 3); // sdot v2.4s, v30.16b, v10.4b[3]\n"
+
+                scale_0 = vmulq_laneq_f32(b_d, a1_d, 0); // "fmul v10.4s, v17.4s, v26.s[0]\n"
+                scale_1 = vmulq_laneq_f32(b_d, a1_d, 1); // "fmul v10.4s, v17.4s, v26.s[1]\n"
+                scale_2 = vmulq_laneq_f32(b_d, a1_d, 2); // "fmul v10.4s, v17.4s, v26.s[2]\n"
+                scale_3 = vmulq_laneq_f32(b_d, a1_d, 3); // "fmul v10.4s, v17.4s, v26.s[3]\n"
+                facc4 = vfmaq_f32(facc4, vcvtq_n_f32_s32(iacc0, 4), scale_0); // "scvtf v9.4s, v9.4s, #0x4\n", "fmla v11.4s, v9.4s, v10.4s\n"
+                facc5 = vfmaq_f32(facc5, vcvtq_n_f32_s32(iacc1, 4), scale_1); // "scvtf v29.4s, v29.4s, #0x4\n", "fmla v13.4s, v29.4s, v10.4s\n"
+                facc6 = vfmaq_f32(facc6, vcvtq_n_f32_s32(iacc2, 4), scale_2); // "scvtf v20.4s, v20.4s, #0x4\n", "fmla v23.4s, v20.4s, v10.4s\n"
+                facc7 = vfmaq_f32(facc7, vcvtq_n_f32_s32(iacc3, 4), scale_3); // "scvtf v2.4s, v2.4s, #0x4\n", "fmla v16.4s, v2.4s, v10.4s\n"
+
+                a_qs_0 = vld1q_s8(a_qs_base2); // "ldr q24, [x22, #0x0]\n"
+                a_qs_1 = vld1q_s8(a_qs_base2 + 0x10); // "ldr q9, [x22, #0x10]\n"
+                a_qs_2 = vld1q_s8(a_qs_base2 + 0x20); // "ldr q24, [x22, #0x20]\n"
+                a_qs_3 = vld1q_s8(a_qs_base2 + 0x30); // "ldr q9, [x22, #0x30]\n"
+                a_qs_4 = vld1q_s8(a_qs_base2 + 0x40); // "ldr q9, [x22, #0x30]\n"
+                a_qs_5 = vld1q_s8(a_qs_base2 + 0x50); // "ldr q9, [x22, #0x30]\n"
+                a_qs_6 = vld1q_s8(a_qs_base2 + 0x60); // "ldr q24, [x22, #0x60]\n"
+                a_qs_7 = vld1q_s8(a_qs_base2 + 0x70); // "ldr q9, [x22, #0x70]\n"
+                float16x4_t a2_d_f16 = vld1_f16((const float16_t *)(a_qs_base2 - 8)); // "ldr d29, [x22, #-0x8]\n"
+                float32x4_t a2_d = vcvt_f32_f16(a2_d_f16); // "fcvtl v29.4s, v29.4h\n"
+                a_qs_base2 += sizeof(block_q8_0x4); // "add x22, x22, #0x88\n"
+
+                iacc0 = vdupq_n_s32(0); // "movi v20.4s, #0x0\n"
+                iacc1 = vdupq_n_s32(0); // "movi v10.4s, #0x0\n"
+                iacc2 = vdupq_n_s32(0); // "movi v26.4s, #0x0\n"
+                iacc3 = vdupq_n_s32(0); // "movi v2.4s, #0x0\n"
+
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_low, a_qs_0, 0); // sdot v20.4s, v12.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_low, a_qs_0, 1); // sdot v10.4s, v12.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_low, a_qs_0, 2); // sdot v26.4s, v12.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_low, a_qs_0, 3); // sdot v2.4s, v12.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_low, a_qs_1, 0); // sdot v20.4s, v31.16b, v9.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_low, a_qs_1, 1); // sdot v10.4s, v31.16b, v9.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_low, a_qs_1, 2); // sdot v26.4s, v31.16b, v9.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_low, a_qs_1, 3); // sdot v2.4s, v31.16b, v9.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_low, a_qs_2, 0); // sdot v20.4s, v6.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_low, a_qs_2, 1); // sdot v10.4s, v6.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_low, a_qs_2, 2); // sdot v26.4s, v6.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_low, a_qs_2, 3); // sdot v2.4s, v6.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_low, a_qs_3, 0); // sdot v20.4s, v28.16b, v9.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_low, a_qs_3, 1); // sdot v10.4s, v28.16b, v9.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_low, a_qs_3, 2); // sdot v26.4s, v28.16b, v9.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_low, a_qs_3, 3); // sdot v2.4s, v28.16b, v9.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_high, a_qs_4, 0); // sdot v20.4s, v3.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_high, a_qs_4, 1); // sdot v10.4s, v3.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_high, a_qs_4, 2); // sdot v26.4s, v3.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_high, a_qs_4, 3); // sdot v2.4s, v3.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_high, a_qs_5, 0); // sdot v20.4s, v22.16b, v9.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_high, a_qs_5, 1); // sdot v10.4s, v22.16b, v9.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_high, a_qs_5, 2); // sdot v26.4s, v22.16b, v9.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_high, a_qs_5, 3); // sdot v2.4s, v22.16b, v9.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_high, a_qs_6, 0); // sdot v20.4s, v27.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_high, a_qs_6, 1); // sdot v10.4s, v27.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_high, a_qs_6, 2); // sdot v26.4s, v27.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_high, a_qs_6, 3); // sdot v2.4s, v27.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_high, a_qs_7, 0); // sdot v20.4s, v30.16b, v9.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_high, a_qs_7, 1); // sdot v10.4s, v30.16b, v9.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_high, a_qs_7, 2); // sdot v26.4s, v30.16b, v9.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_high, a_qs_7, 3); // sdot v2.4s, v30.16b, v9.4b[3]\n"
+
+                scale_0 = vmulq_laneq_f32(b_d, a2_d, 0); // "fmul v9.4s, v17.4s, v29.s[0]\n"
+                scale_1 = vmulq_laneq_f32(b_d, a2_d, 1); // "fmul v20.4s, v17.4s, v29.s[1]\n"
+                scale_2 = vmulq_laneq_f32(b_d, a2_d, 2); // "fmul v10.4s, v17.4s, v29.s[2]\n"
+                scale_3 = vmulq_laneq_f32(b_d, a2_d, 3); // "fmul v29.4s, v17.4s, v29.s[3]\n"
+                facc8  = vfmaq_f32(facc8,  vcvtq_n_f32_s32(iacc0, 4), scale_0); // "scvtf v20.4s, v20.4s, #0x4\n", "fmla v25.4s, v20.4s, v9.4s\n"
+                facc9  = vfmaq_f32(facc9,  vcvtq_n_f32_s32(iacc1, 4), scale_1); // "scvtf v10.4s, v10.4s, #0x4\n", "fmla v7.4s, v10.4s, v20.4s\n"
+                facc10 = vfmaq_f32(facc10, vcvtq_n_f32_s32(iacc2, 4), scale_2); // "scvtf v26.4s, v26.4s, #0x4\n", "fmla v0.4s, v26.4s, v10.4s\n"
+                facc11 = vfmaq_f32(facc11, vcvtq_n_f32_s32(iacc3, 4), scale_3); // "scvtf v2.4s, v2.4s, #0x4\n", "fmla v4.4s, v2.4s, v29.4s\n"
+
+                a_qs_0 = vld1q_s8(a_qs_base3); // "ldr q24, [x21, #0x0]\n"
+                a_qs_1 = vld1q_s8(a_qs_base3 + 0x10); // "ldr q9, [x21, #0x10]\n"
+                a_qs_2 = vld1q_s8(a_qs_base3 + 0x20); // "ldr q12, [x21, #0x20]\n"
+                a_qs_3 = vld1q_s8(a_qs_base3 + 0x30); // "ldr q9, [x21, #0x30]\n"
+                a_qs_4 = vld1q_s8(a_qs_base3 + 0x40); // "ldr q12, [x21, #0x40]\n"
+                a_qs_5 = vld1q_s8(a_qs_base3 + 0x50); // "ldr q9, [x21, #0x50]\n"
+                a_qs_6 = vld1q_s8(a_qs_base3 + 0x60); //"ldr q12, [x21, #0x60]\n"
+                a_qs_7 = vld1q_s8(a_qs_base3 + 0x70); // "ldr q17, [x21, #0x70]\n"
+                float16x4_t a3_d_f16 = vld1_f16((const float16_t *)(a_qs_base3 - 8)); // "ldr d20, [x21, #-0x8]\n"
+                float32x4_t a3_d = vcvt_f32_f16(a3_d_f16); // "fcvtl v20.4s, v20.4h\n"
+                a_qs_base3 += sizeof(block_q8_0x4); // "add x21, x21, #0x88\n"
+
+                iacc0 = vdupq_n_s32(0); // "movi v26.4s, #0x0\n"
+                iacc1 = vdupq_n_s32(0); // "movi v10.4s, #0x0\n"
+                iacc2 = vdupq_n_s32(0); // "movi v2.4s, #0x0\n"
+                iacc3 = vdupq_n_s32(0); // "movi v29.4s, #0x0\n"
+
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_low, a_qs_0, 0); // sdot v26.4s, v12.16b, v24.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_low, a_qs_0, 1); // sdot v10.4s, v12.16b, v24.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_low, a_qs_0, 2); // sdot v2.4s, v12.16b, v24.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_low, a_qs_0, 3); // sdot v29.4s, v12.16b, v24.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_low, a_qs_1, 0); // sdot v26.4s, v31.16b, v9.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_low, a_qs_1, 1); // sdot v10.4s, v31.16b, v9.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_low, a_qs_1, 2); // sdot v2.4s, v31.16b, v9.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_low, a_qs_1, 3); // sdot v29.4s, v31.16b, v9.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_low, a_qs_2, 0); // sdot v26.4s, v6.16b, v12.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_low, a_qs_2, 1); // sdot v10.4s, v6.16b, v12.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_low, a_qs_2, 2); // sdot v2.4s, v6.16b, v12.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_low, a_qs_2, 3); // sdot v29.4s, v6.16b, v12.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_low, a_qs_3, 0); // sdot v26.4s, v28.16b, v9.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_low, a_qs_3, 1); // sdot v10.4s, v28.16b, v9.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_low, a_qs_3, 2); // sdot v2.4s, v28.16b, v9.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_low, a_qs_3, 3); // sdot v29.4s, v28.16b, v9.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_high, a_qs_4, 0); // sdot v26.4s, v3.16b, v12.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_high, a_qs_4, 1); // sdot v10.4s, v3.16b, v12.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_high, a_qs_4, 2); // sdot v2.4s, v3.16b, v12.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_high, a_qs_4, 3); // sdot v29.4s, v3.16b, v12.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_high, a_qs_5, 0); // sdot v26.4s, v22.16b, v9.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_high, a_qs_5, 1); // sdot v10.4s, v22.16b, v9.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_high, a_qs_5, 2); // sdot v2.4s, v22.16b, v9.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_high, a_qs_5, 3); // sdot v29.4s, v22.16b, v9.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_high, a_qs_6, 0); // sdot v26.4s, v27.16b, v12.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_high, a_qs_6, 1); // sdot v10.4s, v27.16b, v12.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_high, a_qs_6, 2); // sdot v2.4s, v27.16b, v12.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_high, a_qs_6, 3); // sdot v29.4s, v27.16b, v12.4b[3]\n"
+                iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_high, a_qs_7, 0); // sdot v26.4s, v30.16b, v17.4b[0]\n"
+                iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_high, a_qs_7, 1); // sdot v10.4s, v30.16b, v17.4b[1]\n"
+                iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_high, a_qs_7, 2); // sdot v2.4s, v30.16b, v17.4b[2]\n"
+                iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_high, a_qs_7, 3); // sdot v29.4s, v30.16b, v17.4b[3]\n"
+
+                scale_0 = vmulq_laneq_f32(b_d, a3_d, 0); // "fmul v24.4s, v17.4s, v20.s[0]\n"
+                scale_1 = vmulq_laneq_f32(b_d, a3_d, 1); // "fmul v24.4s, v17.4s, v20.s[1]\n"
+                scale_2 = vmulq_laneq_f32(b_d, a3_d, 2); // "fmul v6.4s, v17.4s, v20.s[2]\n"
+                scale_3 = vmulq_laneq_f32(b_d, a3_d, 3); // "fmul v20.4s, v17.4s, v20.s[3]\n"
+                facc12 = vfmaq_f32(facc12, vcvtq_n_f32_s32(iacc0, 4), scale_0); // "scvtf v26.4s, v26.4s, #0x4\n", "fmla v5.4s, v26.4s, v24.4s\n"
+                facc13 = vfmaq_f32(facc13, vcvtq_n_f32_s32(iacc1, 4), scale_1); // "scvtf v10.4s, v10.4s, #0x4\n", "fmla v21.4s, v10.4s, v31.4s\n"
+                facc14 = vfmaq_f32(facc14, vcvtq_n_f32_s32(iacc2, 4), scale_2); // "scvtf v2.4s, v2.4s, #0x4\n", "fmla v8.4s, v2.4s, v6.4s\n"
+                facc15 = vfmaq_f32(facc15, vcvtq_n_f32_s32(iacc3, 4), scale_3); // "scvtf v29.4s, v29.4s, #0x4\n", "fmla v1.4s, v29.4s, v20.4s\n"
+            } while (k > 0); // "bgt 3b\n"
+
+            // Store results for 16 rows
+            // res_ptr_local is x20 equivalent
+            float *r0 = res_ptr; // "mov x20, %x[res_ptr]\n"
+            nc_remaining -= 4; // "subs x27, x27, #0x4\n"
+            res_ptr += 4; // "add %x[res_ptr], %x[res_ptr], #0x10\n"
+            vst1q_f32(r0, facc0); // "str q15, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc1);  // "add x20, x20, %x[res_stride]\n", "str q19, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc2);  // "add x20, x20, %x[res_stride]\n", "str q18, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc3);  // "add x20, x20, %x[res_stride]\n", "str q14, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc4);  // "add x20, x20, %x[res_stride]\n", "str q11, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc5);  // "add x20, x20, %x[res_stride]\n", "str q13, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc6);  // "add x20, x20, %x[res_stride]\n", "str q23, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc7);  // "add x20, x20, %x[res_stride]\n", "str q16, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc8);  // "add x20, x20, %x[res_stride]\n", "str q25, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc9);  // "add x20, x20, %x[res_stride]\n", "str q7,  [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc10); // "add x20, x20, %x[res_stride]\n", "str q0,  [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc11); // "add x20, x20, %x[res_stride]\n", "str q4,  [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc12); // "add x20, x20, %x[res_stride]\n", "str q5,  [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc13); // "add x20, x20, %x[res_stride]\n", "str q21, [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc14); // "add x20, x20, %x[res_stride]\n", "str q8,  [x20, #0x0]\n"
+            r0 += res_stride; vst1q_f32(r0, facc15); // "add x20, x20, %x[res_stride]\n", "str q1,  [x20, #0x0]\n"
+        } while (nc_remaining != 0); // "bne 2b\n"
+
+        // Advance row pointers
+        nr_remaining -= 0x10; // "sub x10, x10, #0x10\n"
+        res_ptr = res_ptr_next_16; // "mov %x[res_ptr], x26\n"
+        // We consumed 4 blocks of rows (each block 4 rows)
+        a_ptr += 4 * nb; // "mov x20, #0x4\n", "madd %x[a_ptr], x20, x9, %x[a_ptr]\n"
+    }
+
+    // "4:"  // Row loop skip
+    // Tail loop for remaining rows (1 to 15)
+    if (nr_remaining != 0) { // "cbz x10, 9f\n"
+        // Process in chunks of 4 rows
+        do { // "5:"  // Row tail: Row loop
+            const int8_t *b_qs = b_ptr->qs; // "add x24, %x[b_ptr], #0x8\n"
+            int nc_remaining = nc; // "mov x23, %x[nc]\n"
+            float *res_ptr_next_4 = res_ptr + (res_stride << 2); // "add x22, %x[res_ptr], %x[res_stride], LSL #2\n"
+
+            do { // "6:"  // Row tail: Column loop
+                // Initialize accumulators for 4 rows
+                float32x4_t v15 = vdupq_n_f32(0.0f); // "movi v15.16b, #0x0\n"
+                float32x4_t v19 = vdupq_n_f32(0.0f); // "movi v19.16b, #0x0\n"
+                float32x4_t v18 = vdupq_n_f32(0.0f); // "movi v18.16b, #0x0\n"
+                float32x4_t v14 = vdupq_n_f32(0.0f); // "movi v14.16b, #0x0\n"
+                const int8_t *a_qs = a_ptr->qs; // "add x25, %x[a_ptr], #0x8\n"
+                int k = nb; // "mov x21, %x[nb]\n"
+
+                do { // "7:"  // Row tail: Block loop
+                    k--; // "subs x21, x21, #0x1\n"
+                    int8x16_t b_qs_0 = vld1q_s8(b_qs); // "ldr q7, [x24, #0x0]\n"
+                    int8x16_t b_qs_1 = vld1q_s8(b_qs + 0x10); // "ldr q3, [x24, #0x10]\n"
+                    int8x16_t b_qs_2 = vld1q_s8(b_qs + 0x20); // "ldr q13, [x24, #0x20]\n"
+                    int8x16_t b_qs_3 = vld1q_s8(b_qs + 0x30); // "ldr q28, [x24, #0x30]\n"
+
+                    int8x16_t a_qs_0 = vld1q_s8(a_qs); // "ldr q5, [x25, #0x0]\n"
+                    int8x16_t a_qs_1 = vld1q_s8(a_qs + 0x10); // "ldr q2, [x25, #0x10]\n"
+                    int8x16_t a_qs_2 = vld1q_s8(a_qs + 0x20); // "ldr q31, [x25, #0x20]\n"
+                    int8x16_t a_qs_3 = vld1q_s8(a_qs + 0x30); // "ldr q27, [x25, #0x30]\n"
+                    int8x16_t a_qs_4 = vld1q_s8(a_qs + 0x40); // "ldr q26, [x25, #0x40]\n"
+                    int8x16_t a_qs_5 = vld1q_s8(a_qs + 0x50); // "ldr q25, [x25, #0x50]\n"
+                    int8x16_t a_qs_6 = vld1q_s8(a_qs + 0x60); // "ldr q24, [x25, #0x60]\n"
+                    int8x16_t a_qs_7 = vld1q_s8(a_qs + 0x70); // "ldr q16, [x25, #0x70]\n"
+
+                    int32x4_t iacc0 = vdupq_n_s32(0); // "movi v4.4s, #0x0\n"
+                    int32x4_t iacc1 = vdupq_n_s32(0); // "movi v1.4s, #0x0\n"
+                    int32x4_t iacc2 = vdupq_n_s32(0); // "movi v0.4s, #0x0\n"
+                    int32x4_t iacc3 = vdupq_n_s32(0); // "movi v30.4s, #0x0\n"
+
+                    // Unpack Q4
+                    int8x16_t b_qs_0_low = b_qs_0 << 4; // "sshl v20.16b, v7.16b, v9.16b\n"
+                    int8x16_t b_qs_1_low = b_qs_1 << 4; // "sshl v17.16b, v3.16b, v9.16b\n"
+                    int8x16_t b_qs_2_low = b_qs_2 << 4; // "sshl v22.16b, v13.16b, v9.16b\n"
+                    int8x16_t b_qs_3_low = b_qs_3 << 4; // "sshl v9.16b, v28.16b, v9.16b\n"
+
+                    int8x16_t b_qs_0_high = b_qs_0 & 0xf0U; // "and v7.16b, v7.16b, v29.16b\n"
+                    int8x16_t b_qs_1_high = b_qs_1 & 0xf0U; // "and v3.16b, v3.16b, v29.16b\n"
+                    int8x16_t b_qs_2_high = b_qs_2 & 0xf0U; // "and v13.16b, v13.16b, v29.16b\n"
+                    int8x16_t b_qs_3_high = b_qs_3 & 0xf0U; // "and v28.16b, v28.16b, v29.16b\n"
+
+                    float16x4_t b_d_f16 = vld1_f16((const float16_t *)(b_qs - 8)); // "sub x20, x24, #0x8\n", "ldr d21, [x20, #0x0]\n"
+                    float16x4_t a_d_f16 = vld1_f16((const float16_t *)(a_qs - 8)); // "ldr d12, [x25, #-0x8]\n"
+                    a_qs += sizeof(block_q8_0x4); // "add x25, x25, #0x88\n"
+                    b_qs += sizeof(block_q4_0x4); // "add x24, x24, #0x48\n"
+
+                    float32x4_t b_d = vcvt_f32_f16(b_d_f16); // "fcvtl v21.4s, v21.4h\n"
+                    float32x4_t a_d = vcvt_f32_f16(a_d_f16); // "fcvtl v12.4s, v12.4h\n"
+
+                    // Dot with low
+                    iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_low, a_qs_0, 0); // sdot v4.4s, v20.16b, v5.4b[0]\n"
+                    iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_low, a_qs_0, 1); // sdot v1.4s, v20.16b, v5.4b[1]\n"
+                    iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_low, a_qs_0, 2); // sdot v0.4s, v20.16b, v5.4b[2]\n"
+                    iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_low, a_qs_0, 3); // sdot v30.4s, v20.16b, v5.4b[3]\n"
+                    iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_low, a_qs_1, 0); // sdot v4.4s, v17.16b, v2.4b[0]\n"
+                    iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_low, a_qs_1, 1); // sdot v1.4s, v17.16b, v2.4b[1]\n"
+                    iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_low, a_qs_1, 2); // sdot v0.4s, v17.16b, v2.4b[2]\n"
+                    iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_low, a_qs_1, 3); // sdot v30.4s, v17.16b, v2.4b[3]\n"
+                    iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_low, a_qs_2, 0); // sdot v4.4s, v22.16b, v31.4b[0]\n"
+                    iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_low, a_qs_2, 1); // sdot v1.4s, v22.16b, v31.4b[1]\n"
+                    iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_low, a_qs_2, 2); // sdot v0.4s, v22.16b, v31.4b[2]\n"
+                    iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_low, a_qs_2, 3); // sdot v30.4s, v22.16b, v31.4b[3]\n"
+                    iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_low, a_qs_3, 0); // sdot v4.4s, v9.16b, v27.4b[0]\n"
+                    iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_low, a_qs_3, 1); // sdot v1.4s, v9.16b, v27.4b[1]\n"
+                    iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_low, a_qs_3, 2); // sdot v0.4s, v9.16b, v27.4b[2]\n"
+                    iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_low, a_qs_3, 3); // sdot v30.4s, v9.16b, v27.4b[3]\n"
+                    iacc0 = vdotq_laneq_s32(iacc0, b_qs_0_high, a_qs_4, 0); // sdot v4.4s, v7.16b, v26.4b[0]\n"
+                    iacc1 = vdotq_laneq_s32(iacc1, b_qs_0_high, a_qs_4, 1); // sdot v1.4s, v7.16b, v26.4b[1]\n"
+                    iacc2 = vdotq_laneq_s32(iacc2, b_qs_0_high, a_qs_4, 2); // sdot v0.4s, v7.16b, v26.4b[2]\n"
+                    iacc3 = vdotq_laneq_s32(iacc3, b_qs_0_high, a_qs_4, 3); // sdot v30.4s, v7.16b, v26.4b[3]\n"
+                    iacc0 = vdotq_laneq_s32(iacc0, b_qs_1_high, a_qs_5, 0); // sdot v4.4s, v3.16b, v25.4b[0]\n"
+                    iacc1 = vdotq_laneq_s32(iacc1, b_qs_1_high, a_qs_5, 1); // sdot v1.4s, v3.16b, v25.4b[1]\n"
+                    iacc2 = vdotq_laneq_s32(iacc2, b_qs_1_high, a_qs_5, 2); // sdot v0.4s, v3.16b, v25.4b[2]\n"
+                    iacc3 = vdotq_laneq_s32(iacc3, b_qs_1_high, a_qs_5, 3); // sdot v30.4s, v3.16b, v25.4b[3]\n"
+                    iacc0 = vdotq_laneq_s32(iacc0, b_qs_2_high, a_qs_6, 0); // sdot v4.4s, v13.16b, v24.4b[0]\n"
+                    iacc1 = vdotq_laneq_s32(iacc1, b_qs_2_high, a_qs_6, 1); // sdot v1.4s, v13.16b, v24.4b[1]\n"
+                    iacc2 = vdotq_laneq_s32(iacc2, b_qs_2_high, a_qs_6, 2); // sdot v0.4s, v13.16b, v24.4b[2]\n"
+                    iacc3 = vdotq_laneq_s32(iacc3, b_qs_2_high, a_qs_6, 3); // sdot v30.4s, v13.16b, v24.4b[3]\n"
+                    iacc0 = vdotq_laneq_s32(iacc0, b_qs_3_high, a_qs_7, 0); // sdot v4.4s, v28.16b, v16.4b[0]\n"
+                    iacc1 = vdotq_laneq_s32(iacc1, b_qs_3_high, a_qs_7, 1); // sdot v1.4s, v28.16b, v16.4b[1]\n"
+                    iacc2 = vdotq_laneq_s32(iacc2, b_qs_3_high, a_qs_7, 2); // sdot v0.4s, v28.16b, v16.4b[2]\n"
+                    iacc3 = vdotq_laneq_s32(iacc3, b_qs_3_high, a_qs_7, 3); // sdot v30.4s, v28.16b, v16.4b[3]\n"
+
+                    // Scale and Accumulate
+                    // Multiply scales: b_d * a_d lanes
+                    float32x4_t scale_0 = vmulq_laneq_f32(b_d, a_d, 0); // "fmul v11.4s, v21.4s, v12.s[0]\n"
+                    float32x4_t scale_1 = vmulq_laneq_f32(b_d, a_d, 1); // "fmul v23.4s, v21.4s, v12.s[1]\n"
+                    float32x4_t scale_2 = vmulq_laneq_f32(b_d, a_d, 2); // "fmul v17.4s, v21.4s, v12.s[2]\n"
+                    float32x4_t scale_3 = vmulq_laneq_f32(b_d, a_d, 3); // "fmul v6.4s, v21.4s, v12.s[3]\n"
+                    v15 = vfmaq_f32(v15, vcvtq_n_f32_s32(iacc0, 4), scale_0); // "scvtf v4.4s, v4.4s, #0x4\n", "fmla v15.4s, v4.4s, v11.4s\n"
+                    v19 = vfmaq_f32(v19, vcvtq_n_f32_s32(iacc1, 4), scale_1); // "scvtf v1.4s, v1.4s, #0x4\n", "fmla v19.4s, v1.4s, v23.4s\n"
+                    v18 = vfmaq_f32(v18, vcvtq_n_f32_s32(iacc2, 4), scale_2); // "scvtf v0.4s, v0.4s, #0x4\n", "fmla v18.4s, v0.4s, v17.4s\n"
+                    v14 = vfmaq_f32(v14, vcvtq_n_f32_s32(iacc3, 4), scale_3); // "scvtf v30.4s, v30.4s, #0x4\n", "fmla v14.4s, v30.4s, v6.4s\n"
+                } while (k > 0); // "bgt 7b\n"
+
+                // Store partial results
+                float *r = res_ptr; // "mov x20, %x[res_ptr]\n"
+                vst1q_f32(r, v15); r += res_stride; // "str q15, [x20, #0x0]\n", "add x20, x20, %x[res_stride]\n"
+                if (nr_remaining > 1) { // "cmp x10, #0x1\n", "ble 8f\n"
+                    vst1q_f32(r, v19); r += res_stride; // "str q19, [x20, #0x0]\n", "add x20, x20, %x[res_stride]\n"
+                }
+                if (nr_remaining > 2) { // "cmp x10, #0x2\n", "ble 8f\n"
+                    vst1q_f32(r, v18); r += res_stride; // "str q18, [x20, #0x0]\n", "add x20, x20, %x[res_stride]\n"
+                }
+                if (nr_remaining > 3) { // "cmp x10, #0x3\n", "ble 8f\n"
+                    vst1q_f32(r, v14); // "str q14, [x20, #0x0]\n"
+                }
+                // "8:"  // Row tail: Accumulator store skip
+                nc_remaining -= 4; // "subs x23, x23, #0x4\n"
+                res_ptr += 4; // "add %x[res_ptr], %x[res_ptr], #0x10\n"
+            } while (nc_remaining != 0); // "bne 6b\n"
+
+            // Tail loop row update
+            nr_remaining -= 4; // "subs x10, x10, #0x4\n"
+            a_ptr += nb; // "add %x[a_ptr], %x[a_ptr], x9\n"
+            res_ptr = res_ptr_next_4; // "mov %x[res_ptr], x22\n"
+        } while (nr_remaining > 0); // "bgt 5b\n"
+    }
+#else
+    const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy;
+    for (int r = 0; r < nr; r += 4) {
+        const block_q4_0x4 * b_ptr = (const block_q4_0x4 *) vx;
+        const block_q8_0x4 * a_base = a_ptr;
+        for (int c = 0; c < nc; c += ncols_interleaved) {
+            a_ptr = a_base;
+
+            float32x4_t acc0 = vdupq_n_f32(0);
+            float32x4_t acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0);
+            float32x4_t acc3 = vdupq_n_f32(0);
+
+            for (int b = 0; b < nb; b++) {
+                float32x4_t ad = vcvt_f32_f16(vld1_f16((const __fp16 *)a_ptr->d));
+                float32x4_t bd = vcvt_f32_f16(vld1_f16((const __fp16 *)b_ptr->d));
+
+                int32x4_t ret0 = vdupq_n_s32(0);
+                int32x4_t ret1 = vdupq_n_s32(0);
+                int32x4_t ret2 = vdupq_n_s32(0);
+                int32x4_t ret3 = vdupq_n_s32(0);
+
+                for (int k = 0; k < 4; k++) {
+                    int8x16_t b0 = vld1q_s8((const int8_t *)b_ptr->qs + 16 * k);
+                    int8x16_t b1 = b0 & 0xf0U;
+                    b0 <<= 4;
+
+                    int8x16_t a0 = vld1q_s8(a_ptr->qs + 16 * k);
+                    int8x16_t a1 = vld1q_s8(a_ptr->qs + 16 * k + 4 * qk/2);
+
+                    ret0 = vdotq_laneq_s32(ret0, b0, a0, 0);
+                    ret1 = vdotq_laneq_s32(ret1, b0, a0, 1);
+                    ret2 = vdotq_laneq_s32(ret2, b0, a0, 2);
+                    ret3 = vdotq_laneq_s32(ret3, b0, a0, 3);
+
+                    ret0 = vdotq_laneq_s32(ret0, b1, a1, 0);
+                    ret1 = vdotq_laneq_s32(ret1, b1, a1, 1);
+                    ret2 = vdotq_laneq_s32(ret2, b1, a1, 2);
+                    ret3 = vdotq_laneq_s32(ret3, b1, a1, 3);
+                }
+                acc0 = vfmaq_f32(acc0, vcvtq_n_f32_s32(ret0, 4), vmulq_laneq_f32(bd, ad, 0));
+                acc1 = vfmaq_f32(acc1, vcvtq_n_f32_s32(ret1, 4), vmulq_laneq_f32(bd, ad, 1));
+                acc2 = vfmaq_f32(acc2, vcvtq_n_f32_s32(ret2, 4), vmulq_laneq_f32(bd, ad, 2));
+                acc3 = vfmaq_f32(acc3, vcvtq_n_f32_s32(ret3, 4), vmulq_laneq_f32(bd, ad, 3));
+                a_ptr++;
+                b_ptr++;
+            }
+            vst1q_f32(s + (r + 0) * bs + c, acc0);
+            vst1q_f32(s + (r + 1) * bs + c, acc1);
+            vst1q_f32(s + (r + 2) * bs + c, acc2);
+            vst1q_f32(s + (r + 3) * bs + c, acc3);
+        }
+    }
+#endif
     return;
 #endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON)
     ggml_gemm_q4_0_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
@@ -1813,6 +2472,39 @@ void ggml_gemm_q4_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     return;
 #endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     ggml_gemm_q4_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q4_0_8x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+    const int ncols_interleaved = 8;
+    const int blocklen = 8;
+
+    assert (n % qk == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+    UNUSED(blocklen);
+
+#if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    DataInfo info{s, (const char *)vy, bs, nb*sizeof(block_q8_0), /*cur_y*/ 0, 1, /*row_mapping*/ nullptr, 0};
+    for (int iy = 0; iy < nr/8; ++iy) {
+        q4_0_funcs[7](n, vx, nb*sizeof(block_q4_0), info, nc);
+        info.cur_y += 8;
+    }
+    const int rem = nr % 8;
+    if (rem) {
+        q4_0_funcs[rem-1](n, vx, nb*sizeof(block_q4_0), info, nc);
+    }
+    return;
+#endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__)
 }
 
 void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
