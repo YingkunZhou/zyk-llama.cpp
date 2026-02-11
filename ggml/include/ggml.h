@@ -635,7 +635,6 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-        GGML_TENSOR_FLAG_IKQ     = 32, // ...determine to use iqk_mul_mat kernel ported from ik_llama.cpp
     };
 
     enum ggml_tri_type {
