@@ -198,20 +198,21 @@ struct ZykQ4_0_T4 {
     __attribute__((always_inline, hot))
     inline void compute_block4(const int8_t * q8_base, float32x4_t * accd) {
         const int nrc_y = 4;
-        // 1 register
+        // + 1 register
         float32x4_t q8_d = vcvt_f32_f16(vld1_f16((const float16_t *)(q8_base - 8)));
-        // 8 registers
+        // + 8 registers
         int8x16x4_t q8qs0 = vld1q_s8_x4(q8_base);
         int8x16x4_t q8qs1 = vld1q_s8_x4(q8_base + 0x40);
 
+        #pragma clang loop unroll_count(2)
         for (int base = 0; base < nrc_y * NREGS; base += nrc_y) {
-            // 4 registers
+            // + 4 registers
             int8x16x4_t q4 = vld1q_s8_x4(q4qs);
             q4qs += 0x40;
-            // 1 register
+            // + 1 register
             int8x16_t b0 = q4.val[0] << 4;
             q4.val[0] = q4.val[0] & 0xf0U;
-            // 4 registers
+            // + 4 registers
             int32x4_t accm0 = vdotq_laneq_s32(vdupq_n_s32(0), b0, q8qs0.val[0], 0);
             int32x4_t accm1 = vdotq_laneq_s32(vdupq_n_s32(0), b0, q8qs0.val[0], 1);
             int32x4_t accm2 = vdotq_laneq_s32(vdupq_n_s32(0), b0, q8qs0.val[0], 2);
@@ -242,24 +243,23 @@ struct ZykQ4_0_T4 {
             accm2 = vdotq_laneq_s32(accm2, q4.val[2], q8qs1.val[2], 2);
             accm3 = vdotq_laneq_s32(accm3, q4.val[2], q8qs1.val[2], 3);
             q4.val[3] = q4.val[3] & 0xf0U;
-            // release 3 registers, and get new 1
+            // - 3 regs, + 1 reg
             float32x4_t q4_d = vcvt_f32_f16(vld1_f16(dptr));
             dptr += 4;
             accm0 = vdotq_laneq_s32(accm0, b0, q8qs0.val[3], 0);
             accm1 = vdotq_laneq_s32(accm1, b0, q8qs0.val[3], 1);
             accm2 = vdotq_laneq_s32(accm2, b0, q8qs0.val[3], 2);
             accm3 = vdotq_laneq_s32(accm3, b0, q8qs0.val[3], 3);
-            // release 1 register, and get new 4
+            // -1 reg, + 4 regs
             float32x4_t scale0 = vmulq_laneq_f32(q4_d, q8_d, 0);
             float32x4_t scale1 = vmulq_laneq_f32(q4_d, q8_d, 1);
             float32x4_t scale2 = vmulq_laneq_f32(q4_d, q8_d, 2);
             float32x4_t scale3 = vmulq_laneq_f32(q4_d, q8_d, 3);
-
             accm0 = vdotq_laneq_s32(accm0, q4.val[3], q8qs1.val[3], 0);
             accm1 = vdotq_laneq_s32(accm1, q4.val[3], q8qs1.val[3], 1);
             accm2 = vdotq_laneq_s32(accm2, q4.val[3], q8qs1.val[3], 2);
             accm3 = vdotq_laneq_s32(accm3, q4.val[3], q8qs1.val[3], 3);
-
+            // -1 reg
             accd[base + 0] = vfmaq_f32(accd[base + 0], vcvtq_n_f32_s32(accm0, 4), scale0);
             accd[base + 1] = vfmaq_f32(accd[base + 1], vcvtq_n_f32_s32(accm1, 4), scale1);
             accd[base + 2] = vfmaq_f32(accd[base + 2], vcvtq_n_f32_s32(accm2, 4), scale2);
@@ -2221,16 +2221,10 @@ void ggml_gemm_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
                 // Store partial results
                 float *r = res_ptr; // "mov x20, %x[res_ptr]\n"
-                vst1q_f32(r, v15); r += res_stride; // "str q15, [x20, #0x0]\n", "add x20, x20, %x[res_stride]\n"
-                if (nr_remaining > 1) { // "cmp x10, #0x1\n", "ble 8f\n"
-                    vst1q_f32(r, v19); r += res_stride; // "str q19, [x20, #0x0]\n", "add x20, x20, %x[res_stride]\n"
-                }
-                if (nr_remaining > 2) { // "cmp x10, #0x2\n", "ble 8f\n"
-                    vst1q_f32(r, v18); r += res_stride; // "str q18, [x20, #0x0]\n", "add x20, x20, %x[res_stride]\n"
-                }
-                if (nr_remaining > 3) { // "cmp x10, #0x3\n", "ble 8f\n"
-                    vst1q_f32(r, v14); // "str q14, [x20, #0x0]\n"
-                }
+                vst1q_f32(r, v15); // "str q15, [x20, #0x0]\n"
+                r += res_stride; vst1q_f32(r, v19); // "add x20, x20, %x[res_stride]\n", "str q19, [x20, #0x0]\n"
+                r += res_stride; vst1q_f32(r, v18); // "add x20, x20, %x[res_stride]\n", "str q18, [x20, #0x0]\n"
+                r += res_stride; vst1q_f32(r, v14); // "add x20, x20, %x[res_stride]\n", "str q14, [x20, #0x0]\n"
                 // "8:"  // Row tail: Accumulator store skip
                 nc_remaining -= 4; // "subs x23, x23, #0x4\n"
                 res_ptr += 4; // "add %x[res_ptr], %x[res_ptr], #0x10\n"
