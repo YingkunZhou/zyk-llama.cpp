@@ -74,8 +74,10 @@ struct block_iq4_nlx8 {
 
 static_assert(sizeof(block_iq4_nlx8) == 8 * sizeof(ggml_half) + QK4_NL * 4, "wrong iq4_nlx8 block size/padding");
 
-#define USE_IQK 1
-#if USE_IQK
+#define USE_IQK 0
+#define USE_ZYK 1
+
+#if USE_IQK || USE_ZYK
 typedef struct {
     ggml_half d[4];
     int8_t qs[4*QK8_0];
@@ -83,7 +85,6 @@ typedef struct {
 static_assert(sizeof(block_q8_0_x4) == 4*sizeof(block_q8_0), "wrong q8_0_x4 block size/padding");
 #endif
 
-#define USE_ZYK 1
 #if USE_ZYK
 // 512-bit/4-bit
 #define QK_T 128

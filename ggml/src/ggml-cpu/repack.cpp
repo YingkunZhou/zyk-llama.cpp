@@ -2158,7 +2158,7 @@ template <> void gemm<block_q8_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
     ggml_gemm_q8_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
-#if USE_IQK
+#if USE_IQK || USE_ZYK
 static void quantize_row_q8_0_x4(const float * x, void * vy, int64_t k) {
     const int nb = k / QK8_0;
     const int nb4 = 4*(nb/4);
@@ -2446,7 +2446,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             const int64_t i11_processed = ne11 - ne11 % 4;
             for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                // TODO: can use ik_llama.cpp implementation for better performance.
+#if USE_ZYK
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
+                    quantize_row_q8_0_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                    continue;
+                }
+#endif
                 from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }
         }
