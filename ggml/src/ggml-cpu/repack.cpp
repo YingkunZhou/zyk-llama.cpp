@@ -17,6 +17,7 @@
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
+#include "iqk_common.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -1752,38 +1753,38 @@ static int repack_q4_0_4_transpose_bl(struct ggml_tensor * t, const void * GGML_
 
     int nblocks = t->ne[0] / QK4_0;
     int nrow = ggml_nrows(t);
-    GGML_ASSERT(nrow == t->ne[1]);
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q4_0));
 
-    ggml_half * dst_d = (ggml_half*) t->data;
-    uint8_t * dst_qs  = (uint8_t*) (dst_d + nblocks * nrow);
-
-    const block_q4_0 * src = (const block_q4_0*) data;
-
-    for (int b = 0; b < nrow; b += QK_T) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < QK_T; i += nrows_interleaved) {
-                const block_q4_0 * tmp[4];
-                for (int j = 0; j < nrows_interleaved; j++) {
-                    tmp[j] = src + x + (i+j) * nblocks;
-                    *dst_d++ = tmp[j]->d;
-                }
-                const int end = ((QK4_0 / 2) * 4) / interleave_block;
-                uint8_t elems[interleave_block];
-                for (int j = 0; j < end; ++j) {
-                    memcpy(elems, tmp[j % 4]->qs + (j / 4) * interleave_block, interleave_block);
-                    if constexpr (interleave_block == 8) {
-                        *reinterpret_cast<uint64_t*>(elems) ^= 0x8888888888888888ULL;
-                    } else {
-                        *reinterpret_cast<uint32_t*>(elems) ^= 0x88888888;
+    for (int k = 0; k < nrow; k += t->ne[1]) {
+        const block_q4_0 * src = (const block_q4_0*) data + k * nblocks;
+        ggml_half * dst_d = (ggml_half*) t->data + k * nblocks * sizeof(block_q4_0) / sizeof(ggml_half);
+        uint8_t   * dst_q = (uint8_t*) (dst_d + nblocks * t->ne[1]);
+        for (int b = 0; b < t->ne[1]; b += QK_T) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                for (int i = 0; i < QK_T; i += nrows_interleaved) {
+                    const block_q4_0 * tmp[4];
+                    for (int j = 0; j < nrows_interleaved; j++) {
+                        tmp[j] = src + x + (i+j) * nblocks;
+                        *dst_d++ = tmp[j]->d;
                     }
-                    memcpy(dst_qs, elems, interleave_block);
-                    dst_qs += interleave_block;
+                    const int end = QK4_0 / 2 * 4 / interleave_block;
+                    uint8_t elems[interleave_block];
+                    for (int j = 0; j < end; ++j) {
+                        memcpy(elems, tmp[j % 4]->qs + (j / 4) * interleave_block, interleave_block);
+                        if constexpr (interleave_block == 8) {
+                            *reinterpret_cast<uint64_t*>(elems) ^= 0x8888888888888888ULL;
+                        } else {
+                            *reinterpret_cast<uint32_t*>(elems) ^= 0x88888888;
+                        }
+                        memcpy(dst_q, elems, interleave_block);
+                        dst_q += interleave_block;
+                    }
                 }
             }
+            src += QK_T * nblocks;
         }
-        src += QK_T * nblocks;
     }
+
     return 0;
 
     GGML_UNUSED(data_size);
@@ -2026,46 +2027,6 @@ template <> void gemv<block_q4_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
     ggml_gemv_q4_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
-#if USE_ZYK
-template <> void gemv<block_q4_0, 4, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    UNUSED(n);
-    UNUSED(s);
-    UNUSED(bs);
-    UNUSED(vx);
-    UNUSED(vy);
-    UNUSED(nr);
-    UNUSED(nc);
-    // GGML_ABORT("no needed, please use gemm instead");
-    return;
-}
-
-template <> void gemv<block_q4_0, 8, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    UNUSED(n);
-    UNUSED(s);
-    UNUSED(bs);
-    UNUSED(vx);
-    UNUSED(vy);
-    UNUSED(nr);
-    UNUSED(nc);
-    // GGML_ABORT("no needed, please use gemm instead");
-    return;
-}
-#endif
-
-#if USE_IQK
-template <> void gemv<block_q4_0, 4, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    UNUSED(n);
-    UNUSED(s);
-    UNUSED(bs);
-    UNUSED(vx);
-    UNUSED(vy);
-    UNUSED(nr);
-    UNUSED(nc);
-    // GGML_ABORT("no needed, please use gemm instead");
-    return;
-}
-#endif
-
 template <> void gemv<block_q4_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q4_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
@@ -2115,8 +2076,24 @@ template <> void gemm<block_q4_0, 4, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t
     ggml_gemm_q4_0_1x4_q8_0(n, s, ix, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_q4_0, 4, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t ix, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q4_0_1x4_q8_0(n, s, ix, vx, vy, nr, nc);
+}
+
 template <> void gemm<block_q4_0, 8, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t ix, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q4_0_1x8_q8_0(n, s, ix, vx, vy, nr, nc);
+}
+
+template <> void gemv<block_q4_0, 8, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    UNUSED(n);
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    // GGML_ABORT("no needed, please use gemm instead");
+    return;
 }
 #endif
 
@@ -2127,6 +2104,10 @@ template <> void gemm<block_q4_K, 4, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t
 #if USE_IQK
 template <> void gemm<block_q4_0, 4, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q4_0_8x4_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<block_q4_0, 4, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_q4_0_8x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 #endif
 
@@ -2429,8 +2410,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
 
-#if USE_IQK
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 4 && NB_COLS == 8) {
+#if USE_IQK || (USE_ZYK && !USE_Q4_0_OPT)
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> &&
+                ((INTER_SIZE == 4 && NB_COLS == 8) || NB_COLS == 1)) {
                 const int64_t i11_processed = 0;
                 for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
                     quantize_row_q8_0_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
@@ -2494,8 +2476,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 #if USE_ZYK
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
-            assert(nr0 % QK_T == 0);
-            nchunk0 = nr0 / QK_T;
+            nchunk0 = (nr0 + QK_T - 1) / QK_T;
         }
 #endif
 
@@ -2511,16 +2492,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;
-            const int64_t ith1 = current_chunk / nchunk0;
-
 #if USE_ZYK
             if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
-                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst->data) + ith0*QK_T, ith0*QK_T,
+                GGML_ASSERT(nchunk1 == 1);
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst->data) + current_chunk*QK_T, current_chunk*QK_T,
                                                                  src0->data, params->wdata, ne1, ne0);
                 current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
                 continue;
             }
 #endif
+            const int64_t ith1 = current_chunk / nchunk0;
+
             int64_t src0_start = dr0 * ith0;
             int64_t src0_end   = MIN(src0_start + dr0, nr0);
 
@@ -2583,11 +2565,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
-        struct mmid_row_mapping {
-            int32_t i1;
-            int32_t i2;
-        };
-
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(nbw3, sizeof(int64_t)) +
                  n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
@@ -2597,11 +2574,21 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
 
         // total of [n_as][ne12 + 1] elemets of type mmid_row_mapping (2*int32_t = int64_t)
-        auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
-        struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
+        auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                          // [n_as]
+        mmid_row_mapping * matrix_rows = (mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
 
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
+#if USE_IQK || USE_ZYK
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> &&
+                ((INTER_SIZE == 4 && NB_COLS == 8) || NB_COLS == 1)) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                    quantize_row_q8_0_x4((float *) ((char *) src1->data + i12 * nb12 + i11 * nb11),
+                                         (void *) (wdata + i12 * nbw2 + i11 * nbw1), ne10);
+                }
+                continue;
+            }
+#endif
             for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                 from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
                            (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
@@ -2644,6 +2631,37 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             //const int64_t nr0 = ne01; // src0 rows
             const int64_t nr1 = cne1; // src1 rows
 
+#if USE_IQK
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 4 && NB_COLS == 8) {
+            if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
+                GGML_ASSERT(ne01%8 == 0);
+                auto nrc_x = (ne01 + nth - 1)/nth;
+                auto first_x = ith*nrc_x;
+                if (first_x + nrc_x > ne01) nrc_x = ne01 - first_x;
+                DataInfo info{(float *) dst->data + first_x, (const char *)wdata, nb1/sizeof(float),
+                              nbw1, 0, (int) ne11, matrix_rows + cur_a*ne12, nb2/sizeof(float)};
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *)&info, nb01,
+                                (const char *)src0_cur + nb01*first_x, nullptr, nr1, nrc_x);
+                continue;
+            }
+        }
+#endif
+#if USE_ZYK
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
+            if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
+                GGML_ASSERT(ne01%8 == 0);
+                auto nrc_x = (ne01 + 4 - 1)/4;
+                GGML_ASSERT(nrc_x == 720);
+                auto first_x = ith*nrc_x;
+                if (first_x + nrc_x > ne01) nrc_x = ne01 - first_x;
+                DataInfo info{(float *) dst->data + first_x, (const char *)wdata, nb1/sizeof(float),
+                              nbw1, 0, (int) ne11, matrix_rows + cur_a*ne12, nb2/sizeof(float)};
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *)&info, first_x,
+                                (const char *)src0_cur, nullptr, nr1, ne0);
+                continue;
+            }
+        }
+#endif
             int64_t src0_cur_start = (ith * ne01) / nth;
             int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
 
@@ -2659,7 +2677,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
                 const int id = row_mapping.i1; // selected expert index
 

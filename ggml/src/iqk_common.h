@@ -56,11 +56,10 @@ struct DataInfo {
 #endif
     inline float * dst_row(int iy) const {
         if (!row_mapping) return s + (cur_y + iy)*bs;
-        int i12 = row_mapping[cur_y + iy].i2;
         int i1  = row_mapping[cur_y + iy].i1;
-        int i2  = i12;
+        int i2  = row_mapping[cur_y + iy].i2;
         return s + i1*bs + i2*bs2;
     }
 };
 
-typedef void (*mul_mat_t)(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
+typedef void (*mul_mat_t)(int n, const void * vx, size_t bx, const DataInfo* info, int nrc_x);
