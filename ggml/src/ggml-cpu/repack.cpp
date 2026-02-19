@@ -1755,13 +1755,15 @@ static int repack_q4_0_4_transpose_bl(struct ggml_tensor * t, const void * GGML_
     int nrow = ggml_nrows(t);
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q4_0));
 
+    int stride = t->ne[1] / 4;
+    if (stride > 2048) stride /= 4;
     for (int k = 0; k < nrow; k += t->ne[1]) {
         const block_q4_0 * src = (const block_q4_0*) data + k * nblocks;
         ggml_half * dst_d = (ggml_half*) t->data + k * nblocks * sizeof(block_q4_0) / sizeof(ggml_half);
         uint8_t   * dst_q = (uint8_t*) (dst_d + nblocks * t->ne[1]);
-        for (int b = 0; b < t->ne[1]; b += QK_T) {
+        for (int b = 0; b < t->ne[1]; b += stride) {
             for (int64_t x = 0; x < nblocks; x++) {
-                for (int i = 0; i < QK_T; i += nrows_interleaved) {
+                for (int i = 0; i < stride; i += nrows_interleaved) {
                     const block_q4_0 * tmp[4];
                     for (int j = 0; j < nrows_interleaved; j++) {
                         tmp[j] = src + x + (i+j) * nblocks;
@@ -1781,7 +1783,7 @@ static int repack_q4_0_4_transpose_bl(struct ggml_tensor * t, const void * GGML_
                     }
                 }
             }
-            src += QK_T * nblocks;
+            src += stride * nblocks;
         }
     }
 
@@ -2475,8 +2477,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         nchunk0                  = MIN(nchunk0, max_nchunk);
 
 #if USE_ZYK
+        int stride = ne01 / 4;
+        if (stride > 2048) stride /= 4;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
-            nchunk0 = (nr0 + QK_T - 1) / QK_T;
+            nchunk0 = nr0 / stride;
         }
 #endif
 
@@ -2495,7 +2499,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #if USE_ZYK
             if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
                 GGML_ASSERT(nchunk1 == 1);
-                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst->data) + current_chunk*QK_T, current_chunk*QK_T,
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst->data) + current_chunk*stride, current_chunk*stride,
                                                                  src0->data, params->wdata, ne1, ne0);
                 current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
                 continue;
@@ -2618,6 +2622,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
 
+#if USE_ZYK
+        int stride = ne01 / 4;
+        if (stride > 2048) stride /= 4;
+#endif
         // compute each matrix multiplication in sequence
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             const int64_t cne1 = matrix_row_counts[cur_a];
@@ -2631,7 +2639,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             //const int64_t nr0 = ne01; // src0 rows
             const int64_t nr1 = cne1; // src1 rows
 
-#if USE_IQK
+#if USE_ZYK
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
+            if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
+                auto nrc_x = ne01 / nth;
+                GGML_ASSERT(nrc_x == stride);
+                auto first_x = ith * nrc_x;
+                DataInfo info{(float *) dst->data + first_x, (const char *)wdata, nb1/sizeof(float),
+                              nbw1, 0, (int) ne11, matrix_rows + cur_a*ne12, nb2/sizeof(float)};
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *)&info, first_x,
+                                (const char *)src0_cur, nullptr, nr1, nrc_x);
+                continue;
+            }
+        }
+#elif USE_IQK
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 4 && NB_COLS == 8) {
             if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
                 GGML_ASSERT(ne01%8 == 0);
@@ -2642,22 +2663,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                               nbw1, 0, (int) ne11, matrix_rows + cur_a*ne12, nb2/sizeof(float)};
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *)&info, nb01,
                                 (const char *)src0_cur + nb01*first_x, nullptr, nr1, nrc_x);
-                continue;
-            }
-        }
-#endif
-#if USE_ZYK
-        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
-            if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
-                GGML_ASSERT(ne01%8 == 0);
-                auto nrc_x = (ne01 + 4 - 1)/4;
-                GGML_ASSERT(nrc_x == 720);
-                auto first_x = ith*nrc_x;
-                if (first_x + nrc_x > ne01) nrc_x = ne01 - first_x;
-                DataInfo info{(float *) dst->data + first_x, (const char *)wdata, nb1/sizeof(float),
-                              nbw1, 0, (int) ne11, matrix_rows + cur_a*ne12, nb2/sizeof(float)};
-                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *)&info, first_x,
-                                (const char *)src0_cur, nullptr, nr1, ne0);
                 continue;
             }
         }
@@ -2737,7 +2742,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 
     if (cur->type == GGML_TYPE_Q4_0) {
 #if USE_ZYK
-        GGML_ASSERT(cur->ne[1] % QK_T == 0);
+        int stride = cur->ne[1] / 4;
+        if (stride > 2048) stride /= 4;
+        GGML_ASSERT(cur->ne[1] % stride == 0);
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
             return &q4_0_1x8_q8_0;
         }

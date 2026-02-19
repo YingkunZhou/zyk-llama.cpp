@@ -25,6 +25,7 @@
 #define UNUSED GGML_UNUSED
 
 #if defined(__aarch64__) && defined(__ARM_NEON) && (defined(__ARM_FEATURE_MATMUL_INT8) || defined(__ARM_FEATURE_DOTPROD))
+#define N32B 4
 static inline void decode_q4_Kx8_scales_mins(const uint8_t * scales_in,
                                              int16x8_t *     out_mins,
                                              int8_t *        out_scales) {
@@ -180,6 +181,22 @@ std::array<mul_mat_t, IQK_MAX_NY-1> q4_0_funcs = {
 #endif
 
 #if USE_ZYK
+static float32x4_t * thread_local_work_buffer(size_t need_elems) {
+    thread_local std::vector<float32x4_t> buffer;
+
+    if (need_elems == 0) {
+        return nullptr;
+    }
+
+    if (buffer.size() < need_elems) {
+        buffer.resize(need_elems);
+    }
+
+    memset(buffer.data(), 0, need_elems * sizeof(float32x4_t));
+
+    return buffer.data();
+}
+
 struct ZykQ4_0_T {
     // nx: the total rows of weight matrix (aka, colunm size)
     // ix: the start row of current process splited weight matrix
@@ -246,7 +263,7 @@ static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo*
     float32x4_t q8_ds[nrc_y];
     ZykQ4_0_T deq(vx, nb, info->bs, ix);
     // Initialize accumulation vector to zero
-    float32x4_t accd[nrc_y * NREGS] = {};
+    float32x4_t * accd = thread_local_work_buffer(nrc_y * nrc_x);
     // #pragma clang loop unroll_count(4)
     for (size_t ib4 = 0; ib4 < nb/4; ++ib4) {
         for (int iy = 0; iy < nrc_y; ++iy) {
@@ -389,7 +406,7 @@ static void mul_mat_q4_t567_q8_0(int n, const void * vx, size_t ix, const DataIn
     float32x4_t q8_ds[nrc_yy];
     ZykQ4_0_T567 deq(vx, nb, info->bs, ix);
     // Initialize accumulation vector to zero
-    float32x4_t accd[nrc_y * NREGS] = {};
+    float32x4_t * accd = thread_local_work_buffer(nrc_y * nrc_x);
     // #pragma clang loop unroll_count(4)
     for (size_t ib4 = 0; ib4 < nb/4; ++ib4) {
         for (int iy = 0; iy < nrc_yy; ++iy) {
@@ -428,7 +445,7 @@ static void mul_mat_q4_t4_q8_0(int n, const void * vx, size_t ix, const DataInfo
     const int8_t * q4qs = (const int8_t *)vx + sizeof(float16_t)*nb*nx + 16*nb*ix;
     const float16_t * dptr = (const float16_t *)vx + nb*ix;
     // Initialize accumulation vector to zero
-    float32x4_t accd[nrc_y * NREGS] = {};
+    float32x4_t * accd = thread_local_work_buffer(nrc_y * nrc_x);
     // #pragma clang loop unroll_count(4)
     for (size_t i = 0; i < nb; ++i) {
         // + 1 register
@@ -506,6 +523,7 @@ static void mul_mat_q4_t4_q8_0(int n, const void * vx, size_t ix, const DataInfo
         }
     }
 }
+#endif
 
 static void mul_mat_q4_t8_q8_0(int n, const void * vx, size_t ix, const DataInfo* info, int nrc_x) {
     GGML_ASSERT(n % QK8_0 == 0);
@@ -520,7 +538,7 @@ static void mul_mat_q4_t8_q8_0(int n, const void * vx, size_t ix, const DataInfo
     const int8_t * q4qs = (const int8_t *)vx + sizeof(float16_t)*nb*nx + 16*nb*ix;
     const float16_t * dptr = (const float16_t *)vx + nb*ix;
     // Initialize accumulation vector to zero
-    float32x4_t accd[nrc_y * NREGS] = {};
+    float32x4_t * accd = thread_local_work_buffer(nrc_y * nrc_x);
     // #pragma clang loop unroll_count(4)
     for (size_t i = 0; i < nb; ++i) {
         // + 2 register
@@ -645,7 +663,6 @@ static void mul_mat_q4_t8_q8_0(int n, const void * vx, size_t ix, const DataInfo
         }
     }
 }
-#endif
 
 std::array<mul_mat_t, IQK_MAX_NY-1> q4_t_funcs = {
     mul_mat_q4_t_q8_0<1>,
@@ -2961,15 +2978,13 @@ void ggml_gemm_q4_0_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const vo
     UNUSED(nc);
 
 #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    int nrc_x = nc / (4 * N32B);
+    if (nrc_x > 2048/N32B) nrc_x /= 4;
     const size_t nb = n / QK8_0;
     DataInfo info{s, (const char *)vy, (size_t) nc, nb*sizeof(block_q8_0), /*cur_y*/ 0, 1, /*row_mapping*/ nullptr, 0};
-    int nrc_x = MIN(QK_T, nc - ix) / N32B;
     for (int iy = 0; iy < nr/8; ++iy) {
-#if USE_Q4_0_OPT
         mul_mat_q4_t8_q8_0(n, vx, ix, &info, nrc_x);
-#else
-        mul_mat_q4_t_q8_0<8>(n, vx, ix, &info, nrc_x);
-#endif
+        // mul_mat_q4_t_q8_0<8>(n, vx, ix, &info, nrc_x);
         info.cur_y += 8;
     }
     const int rem = nr % 8;
@@ -2991,7 +3006,7 @@ void ggml_gemv_q4_0_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const vo
 
 #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     DataInfo* info = (DataInfo *)s;
-    int nrc_x = MIN(QK_T, nc - ix) / N32B;
+    int nrc_x = nc / N32B;
     for (int iy = 0; iy < nr/8; ++iy) {
         mul_mat_q4_t_q8_0<8>(n, vx, ix, info, nrc_x);
         info->cur_y += 8;

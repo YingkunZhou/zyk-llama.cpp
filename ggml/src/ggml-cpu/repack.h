@@ -86,15 +86,6 @@ typedef struct {
 static_assert(sizeof(block_q8_0_x4) == 4*sizeof(block_q8_0), "wrong q8_0_x4 block size/padding");
 #endif
 
-#if USE_ZYK
-// 512-bit/4-bit
-#define QK_T 720
-// the number of 32-bit value in the vector register
-// for aarch64 neon 128/4
-#define N32B 4
-#define NREGS (QK_T / N32B)
-#endif
-
 #if defined(__cplusplus)
 extern "C" {
 #endif
