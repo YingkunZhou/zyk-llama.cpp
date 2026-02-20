@@ -1747,7 +1747,7 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, const void * GGML_RE
 
 #if USE_ZYK
 template <unsigned int interleave_block>
-static int repack_q4_0_4_transpose_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+static int repack_q4_0_transpose_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
     const int nrows_interleaved = 4;
 
@@ -1757,9 +1757,9 @@ static int repack_q4_0_4_transpose_bl(struct ggml_tensor * t, const void * GGML_
 
     int stride = t->ne[1] / 4;
     if (stride > 2048) stride /= 4;
+    const block_q4_0 * src = (const block_q4_0*) data;
     for (int k = 0; k < nrow; k += t->ne[1]) {
-        const block_q4_0 * src = (const block_q4_0*) data + k * nblocks;
-        ggml_half * dst_d = (ggml_half*) t->data + k * nblocks * sizeof(block_q4_0) / sizeof(ggml_half);
+        ggml_half * dst_d = (ggml_half*) ((block_q4_0*) t->data + k * nblocks);
         uint8_t   * dst_q = (uint8_t*) (dst_d + nblocks * t->ne[1]);
         for (int b = 0; b < t->ne[1]; b += stride) {
             for (int64_t x = 0; x < nblocks; x++) {
@@ -1779,6 +1779,45 @@ static int repack_q4_0_4_transpose_bl(struct ggml_tensor * t, const void * GGML_
                             *reinterpret_cast<uint32_t*>(elems) ^= 0x88888888;
                         }
                         memcpy(dst_q, elems, interleave_block);
+                        dst_q += interleave_block;
+                    }
+                }
+            }
+            src += stride * nblocks;
+        }
+    }
+
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
+template <unsigned int interleave_block>
+static int repack_mxfp4_transpose_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_MXFP4);
+    const int nrows_interleaved = 4;
+
+    int nblocks = t->ne[0] / QK_MXFP4;
+    int nrow = ggml_nrows(t);
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_mxfp4));
+
+    int stride = t->ne[1] / 4;
+    if (stride > 2048) stride /= 4;
+    const block_mxfp4 * src = (const block_mxfp4*) data;
+    for (int k = 0; k < nrow; k += t->ne[1]) {
+        uint8_t * dst_d = (uint8_t*) ((block_mxfp4*) t->data + k * nblocks);
+        uint8_t * dst_q = (uint8_t*) (dst_d + nblocks * t->ne[1]);
+        for (int b = 0; b < t->ne[1]; b += stride) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                for (int i = 0; i < stride; i += nrows_interleaved) {
+                    const block_mxfp4 * tmp[4];
+                    for (int j = 0; j < nrows_interleaved; j++) {
+                        tmp[j] = src + x + (i+j) * nblocks;
+                        *dst_d++ = tmp[j]->e;
+                    }
+                    const int end = QK_MXFP4 / 2 * 4 / interleave_block;
+                    for (int j = 0; j < end; ++j) {
+                        memcpy(dst_q, tmp[j % 4]->qs + (j / 4) * interleave_block, interleave_block);
                         dst_q += interleave_block;
                     }
                 }
@@ -1966,11 +2005,19 @@ template <> int repack<block_q4_0, 8, 4>(struct ggml_tensor * t, const void * da
 
 #if USE_ZYK
 template <> int repack<block_q4_0, 4, 1>(struct ggml_tensor * t, const void * data, size_t data_size) {
-    return repack_q4_0_4_transpose_bl<4>(t, data, data_size);
+    return repack_q4_0_transpose_bl<4>(t, data, data_size);
 }
 
 template <> int repack<block_q4_0, 8, 1>(struct ggml_tensor * t, const void * data, size_t data_size) {
-    return repack_q4_0_4_transpose_bl<8>(t, data, data_size);
+    return repack_q4_0_transpose_bl<8>(t, data, data_size);
+}
+
+template <> int repack<block_mxfp4, 4, 1>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_mxfp4_transpose_bl<4>(t, data, data_size);
+}
+
+template <> int repack<block_mxfp4, 8, 1>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_mxfp4_transpose_bl<8>(t, data, data_size);
 }
 #endif
 
@@ -2096,6 +2143,14 @@ template <> void gemv<block_q4_0, 8, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t
     UNUSED(nc);
     // GGML_ABORT("no needed, please use gemm instead");
     return;
+}
+
+template <> void gemm<block_mxfp4, 4, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t ix, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_mxfp4_1x4_q8_0(n, s, ix, vx, vy, nr, nc);
+}
+
+template <> void gemv<block_mxfp4, 4, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t ix, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_mxfp4_1x4_q8_0(n, s, ix, vx, vy, nr, nc);
 }
 #endif
 
@@ -2412,23 +2467,34 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
 
-#if USE_IQK || (USE_ZYK && !USE_Q4_0_OPT)
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> &&
-                ((INTER_SIZE == 4 && NB_COLS == 8) || NB_COLS == 1)) {
-                const int64_t i11_processed = 0;
-                for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
+#if USE_ZYK && !USE_Q4_0_OPT
+            constexpr int group = (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) ? 8 : 4;
+#else
+            constexpr int group = 4;
+#endif
+#if USE_ZYK
+            if constexpr (std::is_same_v<BLOC_TYPE, block_mxfp4> && NB_COLS == 1) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                     quantize_row_q8_0_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
                 }
                 continue;
             }
 #endif
-            // TODO: check for myself tranposed kernel
-            for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+#if USE_IQK
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                    quantize_row_q8_0_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                }
+                continue;
+            }
+#endif
+
+            for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % group; i11 += nth * 4) {
                 ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
                                                             (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
             }
 
-            const int64_t i11_processed = ne11 - ne11 % 4;
+            const int64_t i11_processed = ne11 - ne11 % group;
             for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
 #if USE_ZYK
                 if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
@@ -2479,7 +2545,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #if USE_ZYK
         int stride = ne01 / 4;
         if (stride > 2048) stride /= 4;
-        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
+        if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) && NB_COLS == 1) {
             nchunk0 = nr0 / stride;
         }
 #endif
@@ -2497,7 +2563,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;
 #if USE_ZYK
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
+            if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) && NB_COLS == 1) {
                 GGML_ASSERT(nchunk1 == 1);
                 gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst->data) + current_chunk*stride, current_chunk*stride,
                                                                  src0->data, params->wdata, ne1, ne0);
@@ -2584,7 +2650,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
 #if USE_IQK || USE_ZYK
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> &&
+            if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) &&
                 ((INTER_SIZE == 4 && NB_COLS == 8) || NB_COLS == 1)) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                     quantize_row_q8_0_x4((float *) ((char *) src1->data + i12 * nb12 + i11 * nb11),
@@ -2640,7 +2706,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             const int64_t nr1 = cne1; // src1 rows
 
 #if USE_ZYK
-        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
+        if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) && NB_COLS == 1) {
             if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
                 auto nrc_x = ne01 / nth;
                 GGML_ASSERT(nrc_x == stride);
@@ -2720,6 +2786,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 #if USE_ZYK
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 1, GGML_TYPE_Q8_0> q4_0_1x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 1, GGML_TYPE_Q8_0> q4_0_1x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_mxfp4, 4, 1, GGML_TYPE_Q8_0> mxfp4_1x4_q8_0;
 #elif USE_IQK
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 8, GGML_TYPE_Q8_0> q4_0_8x4_q8_0;
 #endif
@@ -2818,6 +2885,16 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             }
         }
     }
+#if USE_ZYK
+    else if (cur->type == GGML_TYPE_MXFP4) {
+        int stride = cur->ne[1] / 4;
+        if (stride > 2048) stride /= 4;
+        GGML_ASSERT(cur->ne[1] % stride == 0);
+        if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
+            return &mxfp4_1x4_q8_0;
+        }
+    }
+#endif
 
     return nullptr;
 }
