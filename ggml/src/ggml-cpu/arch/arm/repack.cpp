@@ -234,6 +234,215 @@ static inline float32x4_t ggml_e8m0_to_fp32_half_vec(uint32_t packed_x) {
     return vreinterpretq_f32_u32(v_res_bits);
 }
 
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+struct ZykQ4_0_T {
+    // nx: the total rows of weight matrix (aka, colunm size)
+    // ix: the start row of current process splited weight matrix
+    ZykQ4_0_T(const void * vx, size_t nb, size_t nx, size_t ix) {
+        q4qs = (const int8_t *)vx + sizeof(float16_t)*nb*nx + 16*nb*ix; // every block contains 16 bytes qs
+        dptr = (const float16_t *)vx + nb*ix;
+    }
+
+    template <int nrc_y>
+    inline void compute_block(const int8_t ** q8, float32x4_t * q8_ds, float32x4_t * accd, int nrc_x) {
+        constexpr int last_y = nrc_y / 2;
+        int8x16x4_t q8qs[last_y + nrc_y % 2];
+        for (int iy = 0; iy < last_y; ++iy) {
+            int8x16x2_t a0 = vld1q_s8_x2(q8[2*iy+0]);
+            int8x16x2_t a1 = vld1q_s8_x2(q8[2*iy+1]);
+            q8[2*iy+0] += 0x20;
+            q8[2*iy+1] += 0x20;
+            q8qs[iy].val[0] = vreinterpretq_s8_s64(vzip1q_s64(
+                vreinterpretq_s64_s8(a0.val[0]), vreinterpretq_s64_s8(a1.val[0])));
+            q8qs[iy].val[1] = vreinterpretq_s8_s64(vzip2q_s64(
+                vreinterpretq_s64_s8(a0.val[0]), vreinterpretq_s64_s8(a1.val[0])));
+            q8qs[iy].val[2] = vreinterpretq_s8_s64(vzip1q_s64(
+                vreinterpretq_s64_s8(a0.val[1]), vreinterpretq_s64_s8(a1.val[1])));
+            q8qs[iy].val[3] = vreinterpretq_s8_s64(vzip2q_s64(
+                vreinterpretq_s64_s8(a0.val[1]), vreinterpretq_s64_s8(a1.val[1])));
+        }
+        if constexpr(nrc_y % 2) {
+            q8qs[last_y].val[0] = (int8x16_t) vld1q_dup_s64((const int64_t *) q8[2*last_y] + 0);
+            q8qs[last_y].val[1] = (int8x16_t) vld1q_dup_s64((const int64_t *) q8[2*last_y] + 1);
+            q8qs[last_y].val[2] = (int8x16_t) vld1q_dup_s64((const int64_t *) q8[2*last_y] + 2);
+            q8qs[last_y].val[3] = (int8x16_t) vld1q_dup_s64((const int64_t *) q8[2*last_y] + 3);
+            q8[2*last_y] += 0x20;
+        }
+
+        int8x16_t b0[4];
+        // #pragma clang loop unroll_count(2)
+        for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
+            int8x16x4_t q4 = vld1q_s8_x4(q4qs);
+            q4qs += 0x40;
+            float32x4_t q4_d = vcvt_f32_f16(vld1_f16(dptr));
+            float32x4x2_t q4_d2;
+            if constexpr(nrc_y > 1) {
+                // b0 | b0 | b1 | b1
+                q4_d2.val[0] = vzip1q_f32(q4_d, q4_d);
+                // b2 | b2 | b3 | b3
+                q4_d2.val[1] = vzip2q_f32(q4_d, q4_d);
+            }
+            dptr += 4;
+
+            b0[0] = q4.val[0] << 4;        // b0_0~b0_7   | b1_0~b1_7
+            q4.val[0] = q4.val[0] & 0xf0U; // b0_16~b0_23 | b1_16~b1_23
+            b0[1] = q4.val[1] << 4;        // b2_0~b2_7   | b3_0~b3_7
+            q4.val[1] = q4.val[1] & 0xf0U; // b2_16~b2_23 | b3_16~b3_23
+            b0[2] = q4.val[2] << 4;        // b0_8~b0_15  | b1_8~b1_15
+            q4.val[2] = q4.val[2] & 0xf0U; // b0_24~b0_31 | b1_24~b1_31
+            b0[3] = q4.val[3] << 4;        // b2_8~b2_15  | b3_8~b3_15
+            q4.val[3] = q4.val[3] & 0xf0U; // b2_24~b2_31 | b3_24~b3_31
+            #pragma clang loop unroll(full)
+            for (int iy = 0; iy < last_y; ++iy) {
+                float32x4_t scale0 = vmulq_f32(q4_d2.val[0], q8_ds[iy]);
+                float32x4_t scale1 = vmulq_f32(q4_d2.val[1], q8_ds[iy]);
+                // a0_0~a0_7 | a1_0~a1_7
+                int32x4_t accm0 = vmmlaq_s32(vdupq_n_s32(0), b0[0], q8qs[iy].val[0]);
+                int32x4_t accm1 = vmmlaq_s32(vdupq_n_s32(0), b0[1], q8qs[iy].val[0]);
+                // a0_8~a0_15 | a1_8~a1_15
+                accm0 = vmmlaq_s32(accm0, b0[2], q8qs[iy].val[1]);
+                accm1 = vmmlaq_s32(accm1, b0[3], q8qs[iy].val[1]);
+                // a0_16~a0_23 | a1_16~a1_23
+                accm0 = vmmlaq_s32(accm0, q4.val[0], q8qs[iy].val[2]);
+                accm1 = vmmlaq_s32(accm1, q4.val[1], q8qs[iy].val[2]);
+                // a0_24~a0_31 | a1_24~a1_31
+                accm0 = vmmlaq_s32(accm0, q4.val[2], q8qs[iy].val[3]);
+                accm1 = vmmlaq_s32(accm1, q4.val[3], q8qs[iy].val[3]);
+                // b0*a0 | b0*a1 | b1*a0 | b1*a1
+                accd[base+2*iy+0] = vfmaq_f32(accd[base+2*iy+0], vcvtq_n_f32_s32(accm0, 4), scale0);
+                // b2*a0 | b2*a1 | b3*a0 | b3*a1
+                accd[base+2*iy+1] = vfmaq_f32(accd[base+2*iy+1], vcvtq_n_f32_s32(accm1, 4), scale1);
+            }
+            if constexpr(nrc_y % 2) {
+                float32x4_t scale = vmulq_f32(q4_d, q8_ds[last_y]);
+                // a0_0~a0_7 | a0_0~a0_7
+                int32x4_t accm0 = vdotq_s32(vdupq_n_s32(0), b0[0], q8qs[last_y].val[0]);
+                int32x4_t accm1 = vdotq_s32(vdupq_n_s32(0), b0[1], q8qs[last_y].val[0]);
+                // a0_8~a0_15 | a0_8~a0_15
+                accm0 = vdotq_s32(accm0, b0[2], q8qs[last_y].val[1]);
+                accm1 = vdotq_s32(accm1, b0[3], q8qs[last_y].val[1]);
+                // a0_16~a0_23 | a0_16~a0_23
+                accm0 = vdotq_s32(accm0, q4.val[0], q8qs[last_y].val[2]);
+                accm1 = vdotq_s32(accm1, q4.val[1], q8qs[last_y].val[2]);
+                // a0_24~a0_31 | a0_24~a0_31
+                accm0 = vdotq_s32(accm0, q4.val[2], q8qs[last_y].val[3]);
+                accm1 = vdotq_s32(accm1, q4.val[3], q8qs[last_y].val[3]);
+                accm0 = vpaddq_s32(accm0, accm1);
+                // b0*a0 | b1*a0 | b2*a0 | b3*a0
+                accd[base+2*last_y] = vfmaq_f32(accd[base+2*last_y], vcvtq_n_f32_s32(accm0, 4), scale);
+            }
+        }
+    }
+
+    const int8_t * q4qs;
+    const float16_t * dptr;
+};
+
+struct Zyk_MXFP4_T {
+    // nx: the total rows of weight matrix (aka, colunm size)
+    // ix: the start row of current process splited weight matrix
+    Zyk_MXFP4_T(const void * vx, size_t nb, size_t nx, size_t ix) {
+        q4qs = (const uint8_t *)vx + nb*nx + 16*nb*ix; // every block contains 16 bytes qs
+        dptr = (const uint32_t *)vx + nb*ix/sizeof(uint32_t);
+        values = vld1q_s8(kvalues_mxfp4);
+    }
+
+    template <int nrc_y>
+    inline void compute_block(const int8_t ** q8, float32x4_t * q8_ds, float32x4_t * accd, int nrc_x) {
+        constexpr int last_y = nrc_y / 2;
+        int8x16x4_t q8qs[last_y + nrc_y % 2];
+        for (int iy = 0; iy < last_y; ++iy) {
+            int8x16x2_t a0 = vld1q_s8_x2(q8[2*iy+0]);
+            int8x16x2_t a1 = vld1q_s8_x2(q8[2*iy+1]);
+            q8[2*iy+0] += 0x20;
+            q8[2*iy+1] += 0x20;
+            q8qs[iy].val[0] = vreinterpretq_s8_s64(vzip1q_s64(
+                vreinterpretq_s64_s8(a0.val[0]), vreinterpretq_s64_s8(a1.val[0])));
+            q8qs[iy].val[1] = vreinterpretq_s8_s64(vzip2q_s64(
+                vreinterpretq_s64_s8(a0.val[0]), vreinterpretq_s64_s8(a1.val[0])));
+            q8qs[iy].val[2] = vreinterpretq_s8_s64(vzip1q_s64(
+                vreinterpretq_s64_s8(a0.val[1]), vreinterpretq_s64_s8(a1.val[1])));
+            q8qs[iy].val[3] = vreinterpretq_s8_s64(vzip2q_s64(
+                vreinterpretq_s64_s8(a0.val[1]), vreinterpretq_s64_s8(a1.val[1])));
+        }
+        if constexpr(nrc_y % 2) {
+            q8qs[last_y].val[0] = (int8x16_t) vld1q_dup_s64((const int64_t *) q8[2*last_y] + 0);
+            q8qs[last_y].val[1] = (int8x16_t) vld1q_dup_s64((const int64_t *) q8[2*last_y] + 1);
+            q8qs[last_y].val[2] = (int8x16_t) vld1q_dup_s64((const int64_t *) q8[2*last_y] + 2);
+            q8qs[last_y].val[3] = (int8x16_t) vld1q_dup_s64((const int64_t *) q8[2*last_y] + 3);
+            q8[2*last_y] += 0x20;
+        }
+        int8x16_t b0[4];
+        // #pragma clang loop unroll_count(2)
+        for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
+            uint8x16x4_t q4 = vld1q_u8_x4(q4qs);
+            q4qs += 0x40;
+            float32x4_t q4_d = ggml_e8m0_to_fp32_half_vec(*dptr);
+            float32x4x2_t q4_d2;
+            if constexpr(nrc_y > 1) {
+                // b0 | b0 | b1 | b1
+                q4_d2.val[0] = vzip1q_f32(q4_d, q4_d);
+                // b2 | b2 | b3 | b3
+                q4_d2.val[1] = vzip2q_f32(q4_d, q4_d);
+            }
+            dptr += 1;
+
+            b0[0]     = vqtbl1q_s8(values, q4.val[0] & 0x0F);
+            q4.val[0] = vqtbl1q_s8(values, vshrq_n_u8(q4.val[0],4));
+            b0[1]     = vqtbl1q_s8(values, q4.val[1] & 0x0F);
+            q4.val[1] = vqtbl1q_s8(values, vshrq_n_u8(q4.val[1],4));
+            b0[2]     = vqtbl1q_s8(values, q4.val[2] & 0x0F);
+            q4.val[2] = vqtbl1q_s8(values, vshrq_n_u8(q4.val[2],4));
+            b0[3]     = vqtbl1q_s8(values, q4.val[3] & 0x0F);
+            q4.val[3] = vqtbl1q_s8(values, vshrq_n_u8(q4.val[3],4));
+            #pragma clang loop unroll(full)
+            for (int iy = 0; iy < last_y; ++iy) {
+                float32x4_t scale0 = vmulq_f32(q4_d2.val[0], q8_ds[iy]);
+                float32x4_t scale1 = vmulq_f32(q4_d2.val[1], q8_ds[iy]);
+                // a0_0~a0_7 | a1_0~a1_7
+                int32x4_t accm0 = vmmlaq_s32(vdupq_n_s32(0), b0[0], q8qs[iy].val[0]);
+                int32x4_t accm1 = vmmlaq_s32(vdupq_n_s32(0), b0[1], q8qs[iy].val[0]);
+                // a0_8~a0_15 | a1_8~a1_15
+                accm0 = vmmlaq_s32(accm0, b0[2], q8qs[iy].val[1]);
+                accm1 = vmmlaq_s32(accm1, b0[3], q8qs[iy].val[1]);
+                // a0_16~a0_23 | a1_16~a1_23
+                accm0 = vmmlaq_s32(accm0, q4.val[0], q8qs[iy].val[2]);
+                accm1 = vmmlaq_s32(accm1, q4.val[1], q8qs[iy].val[2]);
+                // a0_24~a0_31 | a1_24~a1_31
+                accm0 = vmmlaq_s32(accm0, q4.val[2], q8qs[iy].val[3]);
+                accm1 = vmmlaq_s32(accm1, q4.val[3], q8qs[iy].val[3]);
+                // b0*a0 | b0*a1 | b1*a0 | b1*a1
+                accd[base+2*iy+0] = vfmaq_f32(accd[base+2*iy+0], vcvtq_f32_s32(accm0), scale0);
+                // b2*a0 | b2*a1 | b3*a0 | b3*a1
+                accd[base+2*iy+1] = vfmaq_f32(accd[base+2*iy+1], vcvtq_f32_s32(accm1), scale1);
+            }
+            if constexpr(nrc_y % 2) {
+                float32x4_t scale = vmulq_f32(q4_d, q8_ds[last_y]);
+                // a0_0~a0_7 | a0_0~a0_7
+                int32x4_t accm0 = vdotq_s32(vdupq_n_s32(0), b0[0], q8qs[last_y].val[0]);
+                int32x4_t accm1 = vdotq_s32(vdupq_n_s32(0), b0[1], q8qs[last_y].val[0]);
+                // a0_8~a0_15 | a0_8~a0_15
+                accm0 = vdotq_s32(accm0, b0[2], q8qs[last_y].val[1]);
+                accm1 = vdotq_s32(accm1, b0[3], q8qs[last_y].val[1]);
+                // a0_16~a0_23 | a0_16~a0_23
+                accm0 = vdotq_s32(accm0, q4.val[0], q8qs[last_y].val[2]);
+                accm1 = vdotq_s32(accm1, q4.val[1], q8qs[last_y].val[2]);
+                // a0_24~a0_31 | a0_24~a0_31
+                accm0 = vdotq_s32(accm0, q4.val[2], q8qs[last_y].val[3]);
+                accm1 = vdotq_s32(accm1, q4.val[3], q8qs[last_y].val[3]);
+                accm0 = vpaddq_s32(accm0, accm1);
+                // b0*a0 | b1*a0 | b2*a0 | b3*a0
+                accd[base+2*last_y] = vfmaq_f32(accd[base+2*last_y], vcvtq_f32_s32(accm0), scale);
+            }
+        }
+    }
+
+    const uint8_t * q4qs;
+    const uint32_t * dptr;
+    int8x16_t values;
+};
+
+#else
 struct ZykQ4_0_T {
     // nx: the total rows of weight matrix (aka, colunm size)
     // ix: the start row of current process splited weight matrix
@@ -716,6 +925,7 @@ struct Zyk_MXFP4_T {
     const uint32_t * dptr;
     int8x16_t values;
 };
+#endif
 
 template <typename Dequantizer, int nrc_y>
 static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo* info, int nrc_x) {
@@ -727,7 +937,12 @@ static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo*
     }
 
     float d8[4*nrc_y];
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    constexpr int last_y = nrc_y / 2;
+    float32x4_t q8_ds[last_y + nrc_y % 2];
+#else
     float32x4_t q8_ds[nrc_y];
+#endif
     Dequantizer deq(vx, nb, info->bs, ix);
     // Initialize accumulation vector to zero
     float32x4_t * accd = thread_local_work_buffer(nrc_y * nrc_x);
@@ -738,22 +953,63 @@ static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo*
             q8[iy] += 8;
         }
         for (int k = 0; k < 4; ++k) {
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+            for (int iy = 0; iy < last_y; ++iy) {
+                float32x4_t a_dup = vdupq_n_f32(d8[8*iy+k]);
+                float32x4_t b_dup = vdupq_n_f32(d8[8*iy+4+k]);
+                q8_ds[iy] = vzip1q_f32(a_dup, b_dup);
+            }
+            if constexpr(nrc_y % 2) {
+                q8_ds[last_y] = vdupq_n_f32(d8[8*last_y+k]);
+            }
+#else
             for (int iy = 0; iy < nrc_y; ++iy) q8_ds[iy] = vdupq_n_f32(d8[4*iy+k]);
+#endif
             deq.template compute_block<nrc_y>(q8, q8_ds, accd, nrc_x);
         }
     }
     for (size_t ib = 4*(nb/4); ib < nb; ++ib) {
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+        for (int iy = 0; iy < last_y; ++iy) {
+            float32x4_t a_dup = vdupq_n_f32(GGML_FP16_TO_FP32(*(const ggml_half *)(q8[2*iy+0])));
+            float32x4_t b_dup = vdupq_n_f32(GGML_FP16_TO_FP32(*(const ggml_half *)(q8[2*iy+1])));
+            q8[2*iy+0] += 2;
+            q8[2*iy+1] += 2;
+            q8_ds[iy] = vzip1q_f32(a_dup, b_dup);
+        }
+        if constexpr(nrc_y % 2) {
+            q8_ds[last_y] = vdupq_n_f32(GGML_FP16_TO_FP32(*(const ggml_half *)(q8[2*last_y])));
+            q8[2*last_y] += 2;
+        }
+#else
         for (int iy = 0; iy < nrc_y; ++iy) {
             q8_ds[iy] = vdupq_n_f32(GGML_FP16_TO_FP32(*(const ggml_half *)(q8[iy])));
             q8[iy] += 2;
         }
+#endif
         deq.template compute_block<nrc_y>(q8, q8_ds, accd, nrc_x);
     }
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    for (int iy = 0; iy < last_y; ++iy) {
+        for (int k = 0; k < nrc_x; ++k) {
+            float32x4x2_t result = vuzpq_f32(
+                accd[2*iy+0 + k * nrc_y], accd[2*iy+1 + k * nrc_y]);
+            info->store(k * N32B, 2*iy+0, result.val[0]);
+            info->store(k * N32B, 2*iy+1, result.val[1]);
+        }
+    }
+    if constexpr(nrc_y % 2) {
+        for (int k = 0; k < nrc_x; ++k) {
+            info->store(k * N32B, 2*last_y, accd[2*last_y + k * nrc_y]);
+        }
+    }
+#else
     for (int iy = 0; iy < nrc_y; ++iy) {
         for (int k = 0; k < nrc_x; ++k) {
             info->store(k * N32B, iy, accd[iy + k * nrc_y]);
         }
     }
+#endif
 }
 
 std::array<mul_mat_t, IQK_MAX_NY-1> q4_0_t_funcs = {
@@ -3070,7 +3326,7 @@ void ggml_gemm_q4_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 }
 
 #if USE_ZYK
-void ggml_gemm_q4_0_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+void ggml_gemm_q4_0_trans_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     UNUSED(n);
     UNUSED(s);
     UNUSED(ix);
@@ -3085,8 +3341,11 @@ void ggml_gemm_q4_0_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const vo
     const size_t nb = n / QK8_0;
     DataInfo info{s, (const char *)vy, (size_t) nc, nb*sizeof(block_q8_0), /*cur_y*/ 0, 1, /*row_mapping*/ nullptr, 0};
     for (int iy = 0; iy < nr/8; ++iy) {
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+        mul_mat_q4_t_q8_0<ZykQ4_0_T, 8>(n, vx, ix, &info, nrc_x);
+#else
         mul_mat_q4_t8_q8_0(n, vx, ix, &info, nrc_x);
-        // mul_mat_q4_t_q8_0<ZykQ4_0_T, 8>(n, vx, ix, &info, nrc_x);
+#endif
         info.cur_y += 8;
     }
     const int rem = nr % 8;
@@ -3097,55 +3356,7 @@ void ggml_gemm_q4_0_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const vo
 #endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON)
 }
 
-void ggml_gemv_q4_0_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-    UNUSED(n);
-    UNUSED(s);
-    UNUSED(ix);
-    UNUSED(vx);
-    UNUSED(vy);
-    UNUSED(nr);
-    UNUSED(nc);
-
-#if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    DataInfo* info = (DataInfo *)s;
-    int nrc_x = nc / N32B;
-    for (int iy = 0; iy < nr/8; ++iy) {
-        mul_mat_q4_t_q8_0<ZykQ4_0_T, 8>(n, vx, ix, info, nrc_x);
-        info->cur_y += 8;
-    }
-    const int rem = nr % 8;
-    if (rem) {
-        q4_0_t_funcs[rem-1](n, vx, ix, info, nrc_x);
-    }
-    return;
-#endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON)
-}
-
-void ggml_gemm_q4_0_1x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-    UNUSED(n);
-    UNUSED(s);
-    UNUSED(bs);
-    UNUSED(vx);
-    UNUSED(vy);
-    UNUSED(nr);
-    UNUSED(nc);
-
-#if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-    const int nb = n / QK8_0;
-    DataInfo info{s, (const char *)vy, bs, nb*sizeof(block_q8_0), /*cur_y*/ 0, 1, /*row_mapping*/ nullptr, 0};
-    for (int iy = 0; iy < nr/8; ++iy) {
-        q4_0_funcs[7](n, vx, nb*sizeof(block_q4_0), info, nc);
-        info.cur_y += 8;
-    }
-    const int rem = nr % 8;
-    if (rem) {
-        q4_0_funcs[rem-1](n, vx, nb*sizeof(block_q4_0), info, nc);
-    }
-    return;
-#endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-}
-
-void ggml_gemm_mxfp4_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+void ggml_gemm_mxfp4_trans_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     UNUSED(n);
     UNUSED(s);
     UNUSED(ix);
@@ -3171,7 +3382,31 @@ void ggml_gemm_mxfp4_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const v
 #endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON)
 }
 
-void ggml_gemv_mxfp4_1x4_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+void ggml_gemv_q4_0_trans_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    UNUSED(n);
+    UNUSED(s);
+    UNUSED(ix);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+
+#if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    DataInfo* info = (DataInfo *)s;
+    int nrc_x = nc / N32B;
+    for (int iy = 0; iy < nr/8; ++iy) {
+        mul_mat_q4_t_q8_0<ZykQ4_0_T, 8>(n, vx, ix, info, nrc_x);
+        info->cur_y += 8;
+    }
+    const int rem = nr % 8;
+    if (rem) {
+        q4_0_t_funcs[rem-1](n, vx, ix, info, nrc_x);
+    }
+    return;
+#endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON)
+}
+
+void ggml_gemv_mxfp4_trans_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     UNUSED(n);
     UNUSED(s);
     UNUSED(ix);
