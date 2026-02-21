@@ -338,6 +338,7 @@ struct ZykQ4_0_T {
     const float16_t * dptr;
 };
 
+#if USE_Q4_0_OPT
 static void mul_mat_q4_t8_q8_0(int n, const void * vx, size_t ix, const DataInfo* info, int nrc_x) {
     GGML_ASSERT(n % QK8_0 == 0);
     const size_t nb = n / QK8_0;
@@ -454,6 +455,7 @@ static void mul_mat_q4_t8_q8_0(int n, const void * vx, size_t ix, const DataInfo
         }
     }
 }
+#endif
 
 struct Zyk_MXFP4_T {
     // nx: the total rows of weight matrix (aka, colunm size)
@@ -3458,7 +3460,8 @@ void ggml_gemm_q4_0_trans_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const 
     const size_t nb = n / QK8_0;
     DataInfo info{s, (const char *)vy, (size_t) nc, nb*sizeof(block_q8_0), /*cur_y*/ 0, 1, /*row_mapping*/ nullptr, 0};
     for (int iy = 0; iy < nr/8; ++iy) {
-#if 0
+#if defined(__ARM_FEATURE_MATMUL_INT8) && !USE_Q4_0_OPT
+        // in 8gen2 ARM cortex CPU, this is better that latter
         mul_mat_q4_t_q8_0<ZykQ4_0_T, 8>(n, vx, ix, &info, nrc_x);
 #else
         mul_mat_q4_t8_q8_0(n, vx, ix, &info, nrc_x);
