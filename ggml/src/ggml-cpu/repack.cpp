@@ -2479,7 +2479,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
                 continue;
             }
-#if defined(__ARM_FEATURE_MATMUL_INT8)
+#if 0
             if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                     quantize_row_q8_0_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);

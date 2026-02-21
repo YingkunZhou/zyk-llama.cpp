@@ -338,6 +338,123 @@ struct ZykQ4_0_T {
     const float16_t * dptr;
 };
 
+static void mul_mat_q4_t8_q8_0(int n, const void * vx, size_t ix, const DataInfo* info, int nrc_x) {
+    GGML_ASSERT(n % QK8_0 == 0);
+    const size_t nb = n / QK8_0;
+    constexpr int nrc_y = 8;
+    const int8_t * q8[nrc_y/4];
+    for (int iy = 0; iy < nrc_y/4; ++iy) {
+        q8[iy] = (const int8_t *)(info->src1_row(iy*4));
+    }
+    size_t nx = info->bs;
+    // every block contains 16 bytes qs
+    const int8_t * q4qs = (const int8_t *)vx + sizeof(float16_t)*nb*nx + 16*nb*ix;
+    const float16_t * dptr = (const float16_t *)vx + nb*ix;
+    // Initialize accumulation vector to zero
+    float32x4_t * accd = thread_local_work_buffer(nrc_y * nrc_x);
+    // #pragma clang loop unroll_count(4)
+    for (size_t i = 0; i < nb; ++i) {
+        int64x2_t tmp;
+        float32x4x4_t q8_d;
+        tmp = vreinterpretq_s64_f32(vcvt_f32_f16(vld1_f16((const float16_t *)(q8[0]))));
+        q8_d.val[0] = vreinterpretq_f32_s64(vzip1q_s64(tmp, tmp));
+        q8_d.val[1] = vreinterpretq_f32_s64(vzip2q_s64(tmp, tmp));
+        tmp = vreinterpretq_s64_f32(vcvt_f32_f16(vld1_f16((const float16_t *)(q8[1]))));
+        q8_d.val[2] = vreinterpretq_f32_s64(vzip1q_s64(tmp, tmp));
+        q8_d.val[3] = vreinterpretq_f32_s64(vzip2q_s64(tmp, tmp));
+
+        int8x16x4_t q8qs0 = vld1q_s8_x4(q8[0] + 0x8);
+        int8x16x4_t q8qs1 = vld1q_s8_x4(q8[0] + 0x48);
+        int8x16x4_t q8qs4 = vld1q_s8_x4(q8[1] + 0x8);
+        int8x16x4_t q8qs5 = vld1q_s8_x4(q8[1] + 0x48);
+        q8[0] += sizeof(block_q8_0x4);
+        q8[1] += sizeof(block_q8_0x4);
+
+        for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
+            int8x16x4_t q4 = vld1q_s8_x4(q4qs);
+            int8x16_t b0 = q4.val[0] << 4; // b0_0~7 | b1_0~7
+            q4qs += 0x40;
+            q4.val[0] = q4.val[0] & 0xf0U; // b0_16~23 | b1_16~23
+            int32x4_t accm0 = vmmlaq_s32(vdupq_n_s32(0), b0, q8qs0.val[0]); // a0_0~7 | a1_0~7
+            int32x4_t accm1 = vmmlaq_s32(vdupq_n_s32(0), b0, q8qs0.val[1]); // a2_0~7 | a3_0~7
+            int32x4_t accm2 = vmmlaq_s32(vdupq_n_s32(0), b0, q8qs4.val[0]); // a4_0~7 | a5_0~7
+            int32x4_t accm3 = vmmlaq_s32(vdupq_n_s32(0), b0, q8qs4.val[1]); // a6_0~7 | a7_0~7
+            b0 = q4.val[2] << 4; // b0_8~15 | b1_8~15
+            accm0 = vmmlaq_s32(accm0, q4.val[0], q8qs1.val[0]); // a0_16~23 | a1_16~23
+            accm1 = vmmlaq_s32(accm1, q4.val[0], q8qs1.val[1]); // a2_16~23 | a3_16~23
+            accm2 = vmmlaq_s32(accm2, q4.val[0], q8qs5.val[0]); // a4_16~23 | a5_16~23
+            accm3 = vmmlaq_s32(accm3, q4.val[0], q8qs5.val[1]); // a6_16~23 | a7_16~23
+            q4.val[2] = q4.val[2] & 0xf0U; // b0_24~31 | b1_24~31
+            float32x4x2_t q4_d;
+            q4_d.val[1] = vcvt_f32_f16(vld1_f16(dptr));
+            q4_d.val[0] = vzip1q_f32(q4_d.val[1], q4_d.val[1]); // b0 | b0 | b1 | b1
+            dptr += 4;
+            accm0 = vmmlaq_s32(accm0, b0, q8qs0.val[2]); // a0_8~15 | a1_8~15
+            accm1 = vmmlaq_s32(accm1, b0, q8qs0.val[3]); // a2_8~15 | a3_8~15
+            accm2 = vmmlaq_s32(accm2, b0, q8qs4.val[2]); // a4_8~15 | a5_8~15
+            accm3 = vmmlaq_s32(accm3, b0, q8qs4.val[3]); // a6_8~15 | a7_8~15
+            float32x4_t scale = vmulq_f32(q4_d.val[0], q8_d.val[0]);
+            accm0 = vmmlaq_s32(accm0, q4.val[2], q8qs1.val[2]); // a0_24~31 | a1_24~31
+            accm1 = vmmlaq_s32(accm1, q4.val[2], q8qs1.val[3]); // a2_24~31 | a3_24~31
+            accm2 = vmmlaq_s32(accm2, q4.val[2], q8qs5.val[2]); // a4_24~31 | a5_24~31
+            accm3 = vmmlaq_s32(accm3, q4.val[2], q8qs5.val[3]); // a6_24~31 | a7_24~31
+            b0 = q4.val[1] << 4; // b2_0~7 | b3_0~7
+            // b0*a0 | b0*a1 | b1*a0 | b1*a1
+            accd[base + 0] = vfmaq_f32(accd[base + 0], vcvtq_n_f32_s32(accm0, 4), scale);
+            // b0*a2 | b0*a3 | b1*a2 | b1*a3
+            scale = vmulq_f32(q4_d.val[0], q8_d.val[1]);
+            accd[base + 1] = vfmaq_f32(accd[base + 1], vcvtq_n_f32_s32(accm1, 4), scale);
+            // b0*a4 | b0*a5 | b1*a4 | b1*a5
+            scale = vmulq_f32(q4_d.val[0], q8_d.val[2]);
+            accd[base + 2] = vfmaq_f32(accd[base + 2], vcvtq_n_f32_s32(accm2, 4), scale);
+            // b0*a6 | b0*a7 | b1*a6 | b1*a7
+            scale = vmulq_f32(q4_d.val[0], q8_d.val[3]);
+            accd[base + 3] = vfmaq_f32(accd[base + 3], vcvtq_n_f32_s32(accm3, 4), scale);
+
+            q4.val[1] = q4.val[1] & 0xf0U; // b2_16~23 | b3_16~23
+            accm0 = vmmlaq_s32(vdupq_n_s32(0), b0, q8qs0.val[0]);
+            accm1 = vmmlaq_s32(vdupq_n_s32(0), b0, q8qs0.val[1]);
+            accm2 = vmmlaq_s32(vdupq_n_s32(0), b0, q8qs4.val[0]);
+            accm3 = vmmlaq_s32(vdupq_n_s32(0), b0, q8qs4.val[1]);
+            b0 = q4.val[3] << 4; // b2_8~15 | b3_8~15
+            accm0 = vmmlaq_s32(accm0, q4.val[1], q8qs1.val[0]);
+            accm1 = vmmlaq_s32(accm1, q4.val[1], q8qs1.val[1]);
+            accm2 = vmmlaq_s32(accm2, q4.val[1], q8qs5.val[0]);
+            accm3 = vmmlaq_s32(accm3, q4.val[1], q8qs5.val[1]);
+            q4.val[3] = q4.val[3] & 0xf0U; // b2_24~31 | b3_24~31
+            q4_d.val[1] = vzip2q_f32(q4_d.val[1], q4_d.val[1]); // b2 | b2 | b3 | b3
+            accm0 = vmmlaq_s32(accm0, b0, q8qs0.val[2]);
+            accm1 = vmmlaq_s32(accm1, b0, q8qs0.val[3]);
+            accm2 = vmmlaq_s32(accm2, b0, q8qs4.val[2]);
+            accm3 = vmmlaq_s32(accm3, b0, q8qs4.val[3]);
+            scale = vmulq_f32(q4_d.val[1], q8_d.val[0]);
+            accm0 = vmmlaq_s32(accm0, q4.val[3], q8qs1.val[2]);
+            accm1 = vmmlaq_s32(accm1, q4.val[3], q8qs1.val[3]);
+            accm2 = vmmlaq_s32(accm2, q4.val[3], q8qs5.val[2]);
+            accm3 = vmmlaq_s32(accm3, q4.val[3], q8qs5.val[3]);
+            // b2*a0 | b2*a1 | b3*a0 | b3*a1
+            accd[base + 4] = vfmaq_f32(accd[base + 4], vcvtq_n_f32_s32(accm0, 4), scale);
+            // b2*a2 | b2*a3 | b3*a2 | b3*a3
+            scale = vmulq_f32(q4_d.val[1], q8_d.val[1]);
+            accd[base + 5] = vfmaq_f32(accd[base + 5], vcvtq_n_f32_s32(accm1, 4), scale);
+            // b2*a4 | b2*a5 | b3*a4 | b3*a5
+            scale = vmulq_f32(q4_d.val[1], q8_d.val[2]);
+            accd[base + 6] = vfmaq_f32(accd[base + 6], vcvtq_n_f32_s32(accm2, 4), scale);
+            // b2*a6 | b2*a7 | b3*a6 | b3*a7
+            scale = vmulq_f32(q4_d.val[1], q8_d.val[3]);
+            accd[base + 7] = vfmaq_f32(accd[base + 7], vcvtq_n_f32_s32(accm3, 4), scale);
+        }
+    }
+    for (int iy = 0; iy < nrc_y/2; ++iy) {
+        for (int k = 0; k < nrc_x; ++k) {
+            float32x4x2_t result = vuzpq_f32(
+                accd[iy + k * nrc_y], accd[iy+nrc_y/2 + k * nrc_y]);
+            info->store(k * N32B, 2*iy+0, result.val[0]);
+            info->store(k * N32B, 2*iy+1, result.val[1]);
+        }
+    }
+}
+
 struct Zyk_MXFP4_T {
     // nx: the total rows of weight matrix (aka, colunm size)
     // ix: the start row of current process splited weight matrix
@@ -3341,7 +3458,7 @@ void ggml_gemm_q4_0_trans_q8_0(int n, float * GGML_RESTRICT s, size_t ix, const 
     const size_t nb = n / QK8_0;
     DataInfo info{s, (const char *)vy, (size_t) nc, nb*sizeof(block_q8_0), /*cur_y*/ 0, 1, /*row_mapping*/ nullptr, 0};
     for (int iy = 0; iy < nr/8; ++iy) {
-#if defined(__ARM_FEATURE_MATMUL_INT8)
+#if 0
         mul_mat_q4_t_q8_0<ZykQ4_0_T, 8>(n, vx, ix, &info, nrc_x);
 #else
         mul_mat_q4_t8_q8_0(n, vx, ix, &info, nrc_x);
