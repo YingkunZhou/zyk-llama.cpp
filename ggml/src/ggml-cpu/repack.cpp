@@ -1482,20 +1482,17 @@ static block_q4_0x8 make_block_q4_0x8(block_q4_0 * in) {
     for (int i = 0; i < end; ++i) {
         int src_id = i % 8;
         int src_offset = (i / 8) * blck_size_interleave;
-        int dst_offset;
-        if constexpr (blck_size_interleave == 8) {
-            dst_offset = i * blck_size_interleave;
-        } else {
-            dst_offset = src_offset*8 + src_id*blck_size_interleave;
-        }
+        int dst_offset = i * blck_size_interleave;
 
-        memcpy(&elems, &in[src_id].qs[src_offset], blck_size_interleave);
+        memcpy(elems, &in[src_id].qs[src_offset], blck_size_interleave);
         if constexpr (blck_size_interleave == 8) {
             *reinterpret_cast<uint64_t*>(elems) ^= 0x8888888888888888ULL;
         } else {
+#if defined(__aarch64__)
             *reinterpret_cast<uint32_t*>(elems) ^= 0x88888888;
+#endif
         }
-        memcpy(&out.qs[dst_offset], &elems, blck_size_interleave);
+        memcpy(&out.qs[dst_offset], elems, blck_size_interleave);
     }
 
     return out;
@@ -2310,6 +2307,158 @@ static void quantize_row_q8_0_x4(const float * x, void * vy, int64_t k) {
     }
 #endif
 }
+
+#ifdef __AVX2__
+static inline int hsum_i32_8(const __m256i a) {
+    const __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extractf128_si256(a, 1));
+    const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    const __m128i sum64 = _mm_add_epi32(hi64, sum128);
+    const __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+}
+#endif // __AVX2__
+
+static void quantize_row_q8_2_x4(const float * x, void * vy, int64_t k) {
+    assert(k % QK8_1 == 0);
+    const int nb = k / QK8_1;
+
+    const int nb4 = 4*(nb/4);
+    block_q8_2 * y = (block_q8_2 *)vy;
+    block_q8_2_x4 * y4 = (block_q8_2_x4 *)y;
+#if defined(__aarch64__)
+    for (int i = 0; i < nb; i++) {
+        int i4 = i/4, ir = i%4;
+        float32x4_t srcv [8];
+        float32x4_t asrcv[8];
+        float32x4_t amaxv[8];
+
+        for (int j = 0; j < 8; j++) srcv[j]  = vld1q_f32(x + i*32 + 4*j);
+        for (int j = 0; j < 8; j++) asrcv[j] = vabsq_f32(srcv[j]);
+
+        for (int j = 0; j < 4; j++) amaxv[2*j] = vmaxq_f32(asrcv[2*j], asrcv[2*j+1]);
+        for (int j = 0; j < 2; j++) amaxv[4*j] = vmaxq_f32(amaxv[4*j], amaxv[4*j+2]);
+        for (int j = 0; j < 1; j++) amaxv[8*j] = vmaxq_f32(amaxv[8*j], amaxv[8*j+4]);
+
+        const float amax = vmaxvq_f32(amaxv[0]);
+
+        const float d = amax / ((1 << 7) - 1);
+        const float id = d ? 1.0f/d : 0.0f;
+
+        if (i < nb4) {
+            y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
+        } else {
+            y[i].d = GGML_FP32_TO_FP16(d);
+        }
+
+        int32x4_t accv = vdupq_n_s32(0);
+
+        for (int j = 0; j < 8; j++) {
+            const float32x4_t v  = vmulq_n_f32(srcv[j], id);
+            const int32x4_t   vi = vcvtnq_s32_f32(v);
+
+            if (i < nb4) {
+                y4[i4].qs[QK8_1*ir + 4*j + 0] = vgetq_lane_s32(vi, 0);
+                y4[i4].qs[QK8_1*ir + 4*j + 1] = vgetq_lane_s32(vi, 1);
+                y4[i4].qs[QK8_1*ir + 4*j + 2] = vgetq_lane_s32(vi, 2);
+                y4[i4].qs[QK8_1*ir + 4*j + 3] = vgetq_lane_s32(vi, 3);
+            } else {
+                y[i].qs[4*j + 0] = vgetq_lane_s32(vi, 0);
+                y[i].qs[4*j + 1] = vgetq_lane_s32(vi, 1);
+                y[i].qs[4*j + 2] = vgetq_lane_s32(vi, 2);
+                y[i].qs[4*j + 3] = vgetq_lane_s32(vi, 3);
+            }
+
+            accv = vaddq_s32(accv, vi);
+        }
+
+        if (i < nb4) {
+            y4[i4].d[ir+4] = GGML_FP32_TO_BF16(d * vaddvq_s32(accv)).bits;
+        } else {
+            y[i].s = GGML_FP32_TO_BF16(d * vaddvq_s32(accv)).bits;
+        }
+    }
+#else
+    for (int i = 0; i < nb; i++) {
+        int i4 = i/4, ir = i%4;
+        // Load elements into 4 AVX vectors
+        __m256 v0 = _mm256_loadu_ps( x );
+        __m256 v1 = _mm256_loadu_ps( x + 8 );
+        __m256 v2 = _mm256_loadu_ps( x + 16 );
+        __m256 v3 = _mm256_loadu_ps( x + 24 );
+        x += 32;
+
+        // Compute max(abs(e)) for the block
+        const __m256 signBit = _mm256_set1_ps( -0.0f );
+        __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
+        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v1 ) );
+        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v2 ) );
+        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v3 ) );
+
+        __m128 max4 = _mm_max_ps( _mm256_extractf128_ps( maxAbs, 1 ), _mm256_castps256_ps128( maxAbs ) );
+        max4 = _mm_max_ps( max4, _mm_movehl_ps( max4, max4 ) );
+        max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
+        const float max_scalar = _mm_cvtss_f32( max4 );
+
+        // Quantize these floats
+        float d = max_scalar / 127.f;
+        auto t = GGML_FP32_TO_BF16(d);
+        d = ggml_bf16_to_fp32(t);
+        if (i < nb4) {
+            y4[i4].d[ir] = t.bits;
+        } else {
+            y[i].d = t.bits;
+        }
+        const float id = d > 0 ? 1/d : 0.f;
+        const __m256 mul = _mm256_set1_ps( id );
+
+        // Apply the multiplier
+        v0 = _mm256_mul_ps( v0, mul );
+        v1 = _mm256_mul_ps( v1, mul );
+        v2 = _mm256_mul_ps( v2, mul );
+        v3 = _mm256_mul_ps( v3, mul );
+
+        // Round to nearest integer
+        v0 = _mm256_round_ps( v0, _MM_ROUND_NEAREST );
+        v1 = _mm256_round_ps( v1, _MM_ROUND_NEAREST );
+        v2 = _mm256_round_ps( v2, _MM_ROUND_NEAREST );
+        v3 = _mm256_round_ps( v3, _MM_ROUND_NEAREST );
+
+        // Convert floats to integers
+        __m256i i0 = _mm256_cvtps_epi32( v0 );
+        __m256i i1 = _mm256_cvtps_epi32( v1 );
+        __m256i i2 = _mm256_cvtps_epi32( v2 );
+        __m256i i3 = _mm256_cvtps_epi32( v3 );
+
+        // Compute the sum of the quants and set y[i].s
+        int isum = hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3)));
+        if (i < nb4) {
+            auto i16 = (int16_t *)y4[i4].d;
+            i16[ir+4] = isum;
+        } else {
+            auto i16 = (int16_t *)&y[i].s;
+            i16[0] = isum;
+        }
+
+        // Convert int32 to int16
+        i0 = _mm256_packs_epi32( i0, i1 );  // 0, 1, 2, 3,  8, 9, 10, 11,  4, 5, 6, 7, 12, 13, 14, 15
+        i2 = _mm256_packs_epi32( i2, i3 );  // 16, 17, 18, 19,  24, 25, 26, 27,  20, 21, 22, 23, 28, 29, 30, 31
+                                            // Convert int16 to int8
+        i0 = _mm256_packs_epi16( i0, i2 );  // 0, 1, 2, 3,  8, 9, 10, 11,  16, 17, 18, 19,  24, 25, 26, 27,  4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31
+
+        // We got our precious signed bytes, but the order is now wrong
+        // These AVX2 pack instructions process 16-byte pieces independently
+        // The following instruction is fixing the order
+        const __m256i perm = _mm256_setr_epi32( 0, 4, 1, 5, 2, 6, 3, 7 );
+        i0 = _mm256_permutevar8x32_epi32( i0, perm );
+
+        if (i < nb4) {
+            _mm256_storeu_si256((__m256i *)y4[i4].qs + ir, i0);
+        } else {
+            _mm256_storeu_si256((__m256i *)y[i].qs, i0);
+        }
+    }
+#endif
+}
 #endif
 
 class tensor_traits_base : public ggml::cpu::tensor_traits {
@@ -2325,11 +2474,21 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             case GGML_OP_MUL_MAT:
                 {
                     size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+#if USE_IQK && defined(__AVX2__)
+                    if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
+                        size = (size / sizeof(block_q8_0)) * sizeof(block_q8_2);
+                    }
+#endif
                     return true;
                 }
             case GGML_OP_MUL_MAT_ID:
                 {
                     size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+#if USE_IQK && defined(__AVX2__)
+                    if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
+                        size = (size / sizeof(block_q8_0)) * sizeof(block_q8_2);
+                    }
+#endif
                     size = GGML_PAD(size, sizeof(int64_t)); // + padding for next bloc.
 
                     const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
@@ -2453,7 +2612,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // GGML_ASSERT(ggml_n_dims(op->src[1]) == 2);
 
         char *       wdata = static_cast<char *>(params->wdata);
-        const size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
+        size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
+#if USE_IQK && defined(__AVX2__)
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
+            nbw1 = (nbw1 / sizeof(block_q8_0)) * sizeof(block_q8_2);
+        }
+#endif
         const size_t nbw2  = nbw1 * ne11;
 
         assert(params->wsize >= nbw2 * ne12);
@@ -2491,7 +2655,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #if USE_IQK
             if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+#if defined(__aarch64__)
                     quantize_row_q8_0_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+#else
+                    quantize_row_q8_2_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+#endif
                 }
                 continue;
             }
@@ -2639,7 +2807,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int n_ids = ids->ne[0]; // n_expert_used
         const int n_as  = ne02;       // n_expert
 
-        const size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
+        size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
+#if USE_IQK && defined(__AVX2__)
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
+            nbw1 = (nbw1 / sizeof(block_q8_0)) * sizeof(block_q8_2);
+        }
+#endif
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
@@ -2657,16 +2830,30 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
-#if USE_IQK || USE_ZYK
+#if USE_IQK
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+#if defined(__aarch64__)
+                    quantize_row_q8_0_x4((float *) ((char *) src1->data + i12 * nb12 + i11 * nb11),
+                                         (void *) (wdata + i12 * nbw2 + i11 * nbw1), ne10);
+#else
+                    quantize_row_q8_2_x4((float *) ((char *) src1->data + i12 * nb12 + i11 * nb11),
+                                         (void *) (wdata + i12 * nbw2 + i11 * nbw1), ne10);
+#endif
+                }
+                continue;
+            }
+#endif // USE_IQK
+#if USE_ZYK
             if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) &&
-                ((INTER_SIZE == 4 && NB_COLS == 8) || NB_COLS == 1)) {
+                NB_COLS == 1) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                     quantize_row_q8_0_x4((float *) ((char *) src1->data + i12 * nb12 + i11 * nb11),
                                          (void *) (wdata + i12 * nbw2 + i11 * nbw1), ne10);
                 }
                 continue;
             }
-#endif
+#endif // USE_ZYK
             for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                 from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
                            (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
@@ -2829,7 +3016,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         }
 #elif USE_IQK
         GGML_ASSERT(cur->ne[1] % 8 == 0);
-        if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
+        if ((ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) || ggml_cpu_has_avx2()) {
             return &q4_0_8x4_q8_0;
         }
 #endif
