@@ -2432,11 +2432,9 @@ static void quantize_row_q8_2_x4(const float * x, void * vy, int64_t k) {
         // Compute the sum of the quants and set y[i].s
         int isum = hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3)));
         if (i < nb4) {
-            auto i16 = (int16_t *)y4[i4].d;
-            i16[ir+4] = isum;
+            y4[i4].s[ir] = isum;
         } else {
-            auto i16 = (int16_t *)&y[i].s;
-            i16[0] = isum;
+            y[i].s = isum;
         }
 
         // Convert int32 to int16
