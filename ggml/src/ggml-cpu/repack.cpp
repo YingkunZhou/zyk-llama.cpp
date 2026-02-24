@@ -1743,6 +1743,22 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, const void * GGML_RE
 }
 
 #if USE_ZYK
+float * thread_local_work_buffer(size_t need_elems) {
+    thread_local std::vector<float> buffer;
+
+    if (need_elems == 0) {
+        return nullptr;
+    }
+
+    if (buffer.size() < need_elems) {
+        buffer.resize(need_elems);
+    }
+
+    memset(buffer.data(), 0, need_elems * sizeof(float));
+
+    return buffer.data();
+}
+
 template <unsigned int interleave_block>
 static int repack_q4_0_transpose_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
