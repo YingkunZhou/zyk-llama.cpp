@@ -102,7 +102,29 @@ static_assert(sizeof(block_q8_2_x4) == 4*sizeof(block_q8_2), "wrong q8_2_x4 bloc
 #endif
 
 #if USE_ZYK
-float * thread_local_work_buffer(size_t need_elems);
+template<typename T>
+inline T* thread_local_work_buffer(size_t need_elems) {
+    thread_local std::vector<T> buffer;
+
+    if (need_elems == 0) {
+        return nullptr;
+    }
+
+    if (buffer.size() < need_elems) {
+        buffer.resize(need_elems);
+    }
+
+    memset(buffer.data(), 0, need_elems * sizeof(T));
+
+    return buffer.data();
+}
+#if defined(__AVX512VNNI__)
+#define N32B 16
+#elif defined(__AVX2__)
+#define N32B 8
+#else
+#define N32B 4
+#endif
 #endif
 
 #if defined(__cplusplus)

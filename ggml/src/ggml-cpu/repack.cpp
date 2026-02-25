@@ -1743,26 +1743,10 @@ static int repack_q4_0_to_q4_0_8_bl(struct ggml_tensor * t, const void * GGML_RE
 }
 
 #if USE_ZYK
-float * thread_local_work_buffer(size_t need_elems) {
-    thread_local std::vector<float> buffer;
-
-    if (need_elems == 0) {
-        return nullptr;
-    }
-
-    if (buffer.size() < need_elems) {
-        buffer.resize(need_elems);
-    }
-
-    memset(buffer.data(), 0, need_elems * sizeof(float));
-
-    return buffer.data();
-}
-
 template <unsigned int interleave_block>
 static int repack_q4_0_transpose_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
-    constexpr int nrows_interleaved = 4;
+    constexpr int nrows_interleaved = N32B;
 
     int nblocks = t->ne[0] / QK4_0;
     int nrow = ggml_nrows(t);
@@ -1782,16 +1766,22 @@ static int repack_q4_0_transpose_bl(struct ggml_tensor * t, const void * GGML_RE
                         tmp[j] = src + x + (i+j) * nblocks;
                         *dst_d++ = tmp[j]->d;
                     }
-                    const int end = QK4_0 / 2 * 4 / interleave_block;
-                    uint8_t elems[interleave_block];
+                    const int end = QK4_0 / 2 * nrows_interleaved / interleave_block;
                     for (int j = 0; j < end; ++j) {
-                        memcpy(elems, tmp[j % 4]->qs + (j / 4) * interleave_block, interleave_block);
+#if defined(__aarch64__)
+                        uint8_t elems[interleave_block];
+                        memcpy(elems, tmp[j % nrows_interleaved]->qs + (j / nrows_interleaved)
+                        * interleave_block, interleave_block);
                         if constexpr (interleave_block == 8) {
                             *reinterpret_cast<uint64_t*>(elems) ^= 0x8888888888888888ULL;
                         } else {
                             *reinterpret_cast<uint32_t*>(elems) ^= 0x88888888;
                         }
                         memcpy(dst_q, elems, interleave_block);
+#else
+                        memcpy(dst_q, tmp[j % nrows_interleaved]->qs + (j / nrows_interleaved)
+                        * interleave_block, interleave_block);
+#endif
                         dst_q += interleave_block;
                     }
                 }
@@ -1808,7 +1798,7 @@ static int repack_q4_0_transpose_bl(struct ggml_tensor * t, const void * GGML_RE
 template <unsigned int interleave_block>
 static int repack_mxfp4_transpose_bl(struct ggml_tensor * t, const void * GGML_RESTRICT data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_MXFP4);
-    constexpr int nrows_interleaved = 4;
+    constexpr int nrows_interleaved = N32B;
 
     int nblocks = t->ne[0] / QK_MXFP4;
     int nrow = ggml_nrows(t);
@@ -1828,9 +1818,10 @@ static int repack_mxfp4_transpose_bl(struct ggml_tensor * t, const void * GGML_R
                         tmp[j] = src + x + (i+j) * nblocks;
                         *dst_d++ = tmp[j]->e;
                     }
-                    const int end = QK_MXFP4 / 2 * 4 / interleave_block;
+                    const int end = QK_MXFP4 / 2 * nrows_interleaved / interleave_block;
                     for (int j = 0; j < end; ++j) {
-                        memcpy(dst_q, tmp[j % 4]->qs + (j / 4) * interleave_block, interleave_block);
+                        memcpy(dst_q, tmp[j % nrows_interleaved]->qs + (j / nrows_interleaved)
+                        * interleave_block, interleave_block);
                         dst_q += interleave_block;
                     }
                 }
@@ -2032,9 +2023,7 @@ template <> int repack<block_mxfp4, 4, 1>(struct ggml_tensor * t, const void * d
 template <> int repack<block_mxfp4, 8, 1>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_mxfp4_transpose_bl<8>(t, data, data_size);
 }
-#endif
-
-#if USE_IQK
+#elif USE_IQK
 template <> int repack<block_q4_0, 4, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_0_to_q4_0_8_bl<4>(t, data, data_size);
 }
@@ -2165,13 +2154,7 @@ template <> void gemv<block_mxfp4, 4, 1, GGML_TYPE_Q8_0>(int n, float * s, size_
 template <> void gemv<block_mxfp4, 8, 1, GGML_TYPE_Q8_0>(int n, float * s, size_t ix, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_mxfp4_trans_q8_0(n, s, ix, vx, vy, nr, nc);
 }
-#endif
-
-template <> void gemm<block_q4_K, 4, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-    ggml_gemm_q4_K_8x4_q8_K(n, s, bs, vx, vy, nr, nc);
-}
-
-#if USE_IQK
+#elif USE_IQK
 template <> void gemm<block_q4_0, 4, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q4_0_8x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
@@ -2180,6 +2163,10 @@ template <> void gemv<block_q4_0, 4, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t
     ggml_gemv_q4_0_8x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 #endif
+
+template <> void gemm<block_q4_K, 4, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_q4_K_8x4_q8_K(n, s, bs, vx, vy, nr, nc);
+}
 
 template <> void gemm<block_q4_0, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q4_0_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -2488,20 +2475,32 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             case GGML_OP_MUL_MAT:
                 {
                     size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
-#if USE_IQK && defined(__AVX2__)
+#if defined(__AVX2__)
+#if USE_ZYK
+                    if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) && NB_COLS == 1) {
+                        size = (size / sizeof(block_q8_0)) * sizeof(block_q8_2);
+                    }
+#elif USE_IQK
                     if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
                         size = (size / sizeof(block_q8_0)) * sizeof(block_q8_2);
                     }
+#endif
 #endif
                     return true;
                 }
             case GGML_OP_MUL_MAT_ID:
                 {
                     size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
-#if USE_IQK && defined(__AVX2__)
+#if defined(__AVX2__)
+#if USE_ZYK
+                    if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) && NB_COLS == 1) {
+                        size = (size / sizeof(block_q8_0)) * sizeof(block_q8_2);
+                    }
+#elif USE_IQK
                     if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
                         size = (size / sizeof(block_q8_0)) * sizeof(block_q8_2);
                     }
+#endif
 #endif
                     size = GGML_PAD(size, sizeof(int64_t)); // + padding for next bloc.
 
@@ -2627,10 +2626,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         char *       wdata = static_cast<char *>(params->wdata);
         size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
-#if USE_IQK && defined(__AVX2__)
+#if defined(__AVX2__)
+#if USE_ZYK
+        if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) && NB_COLS == 1) {
+            nbw1 = (nbw1 / sizeof(block_q8_0)) * sizeof(block_q8_2);
+        }
+#elif USE_IQK
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
             nbw1 = (nbw1 / sizeof(block_q8_0)) * sizeof(block_q8_2);
         }
+#endif
 #endif
         const size_t nbw2  = nbw1 * ne11;
 
@@ -2644,29 +2649,26 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
-
-#if USE_ZYK && !USE_Q4_0_OPT
-            constexpr int group = (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) ? 8 : 4;
-#else
-            constexpr int group = 4;
-#endif
 #if USE_ZYK
             if constexpr (std::is_same_v<BLOC_TYPE, block_mxfp4> && NB_COLS == 1) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+#if defined(__aarch64__)
                     quantize_row_q8_0_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+#else
+                    quantize_row_q8_2_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+#endif
                 }
                 continue;
             }
-#if defined(__ARM_FEATURE_MATMUL_INT8) && !USE_Q4_0_OPT
+#if defined(__AVX2__)
             if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    quantize_row_q8_0_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                    quantize_row_q8_2_x4((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
                 }
                 continue;
             }
-#endif // defined(__ARM_FEATURE_MATMUL_INT8)
-#endif // USE_ZYK
-#if USE_IQK
+#endif // defined(__AVX2__)
+#elif USE_IQK
             if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
 #if defined(__aarch64__)
@@ -2679,6 +2681,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 #endif
 
+#if !USE_ZYK
+    constexpr int group = 4;
+#elif defined(__ARM_FEATURE_MATMUL_INT8)
+    constexpr int group = std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1 ? (USE_Q4_0_OPT ? 8 : 1<<30) : 4;
+#else
+    constexpr int group = (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 1 && !USE_Q4_0_OPT) ? 8 : 4;
+#endif
             for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % group; i11 += nth * 4) {
                 ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
                                                             (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
@@ -2822,10 +2831,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int n_as  = ne02;       // n_expert
 
         size_t nbw1 = ggml_row_size(PARAM_TYPE, ne10);
-#if USE_IQK && defined(__AVX2__)
+#if defined(__AVX2__)
+#if USE_ZYK
+        if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) && NB_COLS == 1) {
+            nbw1 = (nbw1 / sizeof(block_q8_0)) * sizeof(block_q8_2);
+        }
+#elif USE_IQK
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
             nbw1 = (nbw1 / sizeof(block_q8_0)) * sizeof(block_q8_2);
         }
+#endif
 #endif
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
@@ -2844,7 +2859,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
-#if USE_IQK
+#if USE_ZYK
+            if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) && NB_COLS == 1) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+#if defined(__aarch64__)
+                    quantize_row_q8_0_x4((float *) ((char *) src1->data + i12 * nb12 + i11 * nb11),
+                                         (void *) (wdata + i12 * nbw2 + i11 * nbw1), ne10);
+#else
+                    quantize_row_q8_2_x4((float *) ((char *) src1->data + i12 * nb12 + i11 * nb11),
+                                         (void *) (wdata + i12 * nbw2 + i11 * nbw1), ne10);
+#endif
+                }
+                continue;
+            }
+#elif USE_IQK
             if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && (INTER_SIZE == 4 && NB_COLS == 8)) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
 #if defined(__aarch64__)
@@ -2857,17 +2885,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
                 continue;
             }
-#endif // USE_IQK
-#if USE_ZYK
-            if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_mxfp4>) &&
-                NB_COLS == 1) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    quantize_row_q8_0_x4((float *) ((char *) src1->data + i12 * nb12 + i11 * nb11),
-                                         (void *) (wdata + i12 * nbw2 + i11 * nbw1), ne10);
-                }
-                continue;
-            }
-#endif // USE_ZYK
+#endif
+
             for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                 from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
                            (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
@@ -3025,7 +3044,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
             return &q4_0_1x8_q8_0;
         }
-        if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
+        if ((ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) || ggml_cpu_has_avx2()) {
             return &q4_0_1x4_q8_0;
         }
 #elif USE_IQK
@@ -3103,7 +3122,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
             return &mxfp4_1x8_q8_0;
         }
-        if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
+        if ((ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) || ggml_cpu_has_avx2()) {
             return &mxfp4_1x4_q8_0;
         }
     }

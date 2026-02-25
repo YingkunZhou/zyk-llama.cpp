@@ -1095,6 +1095,10 @@ GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 
+GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4_unsigned, 16)
+    0+12, 1+12, 2+12, 3+12, 4+12, 6+12, 8+12, 12+12, 0+12, -1+12, -2+12, -3+12, -4+12, -6+12, -8+12, -12+12,
+GGML_TABLE_END()
+
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
 #define IQ1M_DELTA 0.125f
