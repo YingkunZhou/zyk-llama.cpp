@@ -241,6 +241,24 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     pe6.type = PERF_TYPE_RAW; pe6.size = sizeof(struct perf_event_attr);
     pe6.disabled = 1; pe6.exclude_kernel = 1; pe6.exclude_hv = 1;
 
+#if defined(__AVX512VNNI__) // obtained from claude
+    pe0.config = 0x00C0;
+    pe1.config = 0x0076;
+    pe2.config = 0x01AF;
+    pe3.config = 0x01AF;
+    pe4.config = 0x0044;
+    pe5.config = 0x0164;
+    // missed for llc miss
+    pe6.config = 0x0164;
+#elif defined(__AVX2__) // obtained from claude
+    pe0.config = 0x00C0;
+    pe1.config = 0x003C;
+    pe2.config = 0x02a4;
+    pe3.config = 0x001414a3ULL;
+    pe4.config = 0x0551;
+    pe5.config = 0x3f24;
+    pe6.config = 0x20d1;
+#else
     pe0.config = ARMV8_PMUV3_PERFCTR_INST_RETIRED;
     // for microarchitecture-dependent
     // 1. backend_stalled_cycles
@@ -254,6 +272,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     pe4.config = ARMV8_PMUV3_PERFCTR_L1D_CACHE_REFILL;
     pe5.config = ARMV8_PMUV3_PERFCTR_L2D_CACHE_REFILL;
     pe6.config = ARMV8_PMUV3_PERFCTR_LL_CACHE_MISS_RD;
+#endif
 
     // Create the events
     fd0 = perf_event_open(&pe0, 0, -1, -1, 0);
