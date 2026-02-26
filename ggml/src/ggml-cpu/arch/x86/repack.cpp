@@ -196,7 +196,7 @@ struct ZykQ4_0_T {
         }
 
         __m256i v[8];
-        // #pragma clang loop unroll_count(2)
+        #pragma clang loop unroll_count(4)
         for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
             auto q4_d = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)dptr));
             dptr += 8;
@@ -265,7 +265,7 @@ struct Zyk_MXFP4_T {
         }
 
         __m256i v[8];
-        // #pragma clang loop unroll_count(2)
+        #pragma clang loop unroll_count(4)
         for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
             auto q4_d = ggml_e8m0_to_fp32_x8((const __m128i *) dptr);
             dptr += 1;
@@ -332,7 +332,6 @@ static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo*
     Dequantizer deq(vx, nb, info->bs, ix);
     // Initialize accumulation vector to zero
     __m256 * accd = thread_local_work_buffer<__m256>(nrc_y * nrc_x);
-    // #pragma clang loop unroll_count(4)
     for (size_t ib4 = 0; ib4 < nb/4; ++ib4) {
         for (int iy = 0; iy < nrc_y; ++iy) {
             const __m128i scales_vec = _mm_loadu_si128((const __m128i *)q8[iy]);
@@ -342,6 +341,7 @@ static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo*
             _mm_storeu_si128((__m128i *)(s8 + 4*iy), aux_m);
             q8[iy] += 16;
         }
+        // #pragma clang loop unroll(full)
         for (int k = 0; k < 4; ++k) {
             for (int iy = 0; iy < nrc_y; ++iy) {
                 q8_d[iy] = _mm256_set1_ps(d8[4*iy+k]);
