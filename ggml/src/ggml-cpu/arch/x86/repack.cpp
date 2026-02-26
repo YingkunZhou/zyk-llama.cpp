@@ -177,6 +177,12 @@ static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m2
 #include "iqk_common.h"
 
 #if USE_ZYK
+#ifdef HAVE_FANCY_SIMD
+#define MM_LEN      __m512
+#define MM_LENI     __m512i
+#define MM_SET1F32  _mm512_set1_ps
+#define MM_SET1I32  _mm512_set1_epi32
+
 struct ZykQ4_0_T {
     // nx: the total rows of weight matrix (aka, colunm size)
     // ix: the start row of current process splited weight matrix
@@ -186,7 +192,145 @@ struct ZykQ4_0_T {
     }
 
     template <int nrc_y>
-    inline void compute_block(const int8_t ** q8, __m256 * q8_d, __m256i * q8_s, __m256 * accd, int nrc_x) {
+    inline void compute_block(const int8_t ** q8, MM_LEN * q8_d, MM_LENI * q8_s, MM_LEN * accd, int nrc_x) {
+        MM_LENI q8qs[2*nrc_y];
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            auto y = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)q8[iy]));
+            q8[iy] += 0x20; // 32 q8 per invoke
+            q8qs[2*iy+0] = _mm512_shuffle_i32x4(y, y, 0x00);  // 00 00 00 00 -> [lo,lo,lo,lo]
+            q8qs[2*iy+1] = _mm512_shuffle_i32x4(y, y, 0x55);  // 01 01 01 01 -> [hi,hi,hi,hi]
+        }
+
+        MM_LENI v[8];
+        #pragma clang loop unroll_count(4)
+        for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
+            auto q4_d = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)dptr));
+            dptr += N32B;
+            v[0] = _mm512_loadu_si512((const MM_LENI *)q4qs+0);
+            v[1] = _mm512_loadu_si512((const MM_LENI *)q4qs+1);
+            v[2] = _mm512_loadu_si512((const MM_LENI *)q4qs+2);
+            v[3] = _mm512_loadu_si512((const MM_LENI *)q4qs+3);
+            v[4] = _mm512_and_si512(_mm512_srli_epi16(v[0], 4), m4);
+            v[0] = _mm512_and_si512(v[0], m4);
+            v[5] = _mm512_and_si512(_mm512_srli_epi16(v[1], 4), m4);
+            v[1] = _mm512_and_si512(v[1], m4);
+            v[6] = _mm512_and_si512(_mm512_srli_epi16(v[2], 4), m4);
+            v[2] = _mm512_and_si512(v[2], m4);
+            v[7] = _mm512_and_si512(_mm512_srli_epi16(v[3], 4), m4);
+            v[3] = _mm512_and_si512(v[3], m4);
+            q4qs += (16*N32B);
+
+            // #pragma clang loop unroll(full)
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto sumi = _mm512_dpbusd_epi32(q8_s[iy], v[0], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_AAAA));
+                auto scale = _mm512_mul_ps(q4_d, q8_d[iy]);
+                sumi = _mm512_dpbusd_epi32(sumi, v[1], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_BBBB));
+                sumi = _mm512_dpbusd_epi32(sumi, v[2], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_CCCC));
+                sumi = _mm512_dpbusd_epi32(sumi, v[3], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_DDDD));
+                auto accd_val = accd[base + iy];
+                sumi = _mm512_dpbusd_epi32(sumi, v[4], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_AAAA));
+                sumi = _mm512_dpbusd_epi32(sumi, v[5], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_BBBB));
+                sumi = _mm512_dpbusd_epi32(sumi, v[6], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_CCCC));
+                sumi = _mm512_dpbusd_epi32(sumi, v[7], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_DDDD));
+                accd[base + iy] = _mm512_fmadd_ps(scale, _mm512_cvtepi32_ps(sumi), accd_val);
+            }
+        }
+    }
+
+    const int8_t * q4qs;
+    const ggml_half * dptr;
+    const MM_LENI m4 = _mm512_set1_epi8(0xf);
+};
+
+struct Zyk_MXFP4_T {
+    // nx: the total rows of weight matrix (aka, colunm size)
+    // ix: the start row of current process splited weight matrix
+    Zyk_MXFP4_T(const void * vx, size_t nb, size_t nx, size_t ix) {
+        q4qs = (const int8_t *)vx + nb*nx + 16*nb*ix; // every block contains 16 bytes qs
+        dptr = (const __m128i *)vx + nb*ix/N32B;
+    }
+
+    inline MM_LEN ggml_e8m0_to_fp32_x16(const __m128i* packed) {
+        MM_LENI x = _mm512_cvtepu8_epi32(_mm_loadu_si128(packed));
+        MM_LENI result = _mm512_slli_epi32(_mm512_sub_epi32(x, m1), 23);
+        __mmask16 mask0 = _mm512_cmpeq_epi32_mask(x, zero);
+        __mmask16 mask1 = _mm512_cmpeq_epi32_mask(x, m1);
+        result = _mm512_mask_blend_epi32(mask1, result, val1);
+        result = _mm512_mask_blend_epi32(mask0, result, val0);
+        return _mm512_castsi512_ps(result);
+    }
+
+    template <int nrc_y>
+    inline void compute_block(const int8_t ** q8, MM_LEN * q8_d, MM_LENI * q8_s, MM_LEN * accd, int nrc_x) {
+        MM_LENI q8qs[2*nrc_y];
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            auto y = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)q8[iy]));
+            q8[iy] += 0x20; // 32 q8 per invoke
+            q8qs[2*iy+0] = _mm512_shuffle_i32x4(y, y, 0x00);  // 00 00 00 00 -> [lo,lo,lo,lo]
+            q8qs[2*iy+1] = _mm512_shuffle_i32x4(y, y, 0x55);  // 01 01 01 01 -> [hi,hi,hi,hi]
+        }
+
+        MM_LENI v[8];
+        #pragma clang loop unroll_count(4)
+        for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
+            auto q4_d = ggml_e8m0_to_fp32_x16(dptr);
+            dptr += 1;
+            v[0] = _mm512_loadu_si512((const MM_LENI *)q4qs+0);
+            v[1] = _mm512_loadu_si512((const MM_LENI *)q4qs+1);
+            v[2] = _mm512_loadu_si512((const MM_LENI *)q4qs+2);
+            v[3] = _mm512_loadu_si512((const MM_LENI *)q4qs+3);
+            v[4] = _mm512_shuffle_epi8(values, _mm512_and_si512(_mm512_srli_epi16(v[0], 4), m4));
+            v[0] = _mm512_shuffle_epi8(values, _mm512_and_si512(v[0], m4));
+            v[5] = _mm512_shuffle_epi8(values, _mm512_and_si512(_mm512_srli_epi16(v[1], 4), m4));
+            v[1] = _mm512_shuffle_epi8(values, _mm512_and_si512(v[1], m4));
+            v[6] = _mm512_shuffle_epi8(values, _mm512_and_si512(_mm512_srli_epi16(v[2], 4), m4));
+            v[2] = _mm512_shuffle_epi8(values, _mm512_and_si512(v[2], m4));
+            v[7] = _mm512_shuffle_epi8(values, _mm512_and_si512(_mm512_srli_epi16(v[3], 4), m4));
+            v[3] = _mm512_shuffle_epi8(values, _mm512_and_si512(v[3], m4));
+            q4qs += (16*N32B);
+
+            // #pragma clang loop unroll(full)
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto sumi = _mm512_dpbusd_epi32(q8_s[iy], v[0], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_AAAA));
+                auto scale = _mm512_mul_ps(q4_d, q8_d[iy]);
+                sumi = _mm512_dpbusd_epi32(sumi, v[1], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_BBBB));
+                sumi = _mm512_dpbusd_epi32(sumi, v[2], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_CCCC));
+                sumi = _mm512_dpbusd_epi32(sumi, v[3], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_DDDD));
+                auto accd_val = accd[base + iy];
+                sumi = _mm512_dpbusd_epi32(sumi, v[4], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_AAAA));
+                sumi = _mm512_dpbusd_epi32(sumi, v[5], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_BBBB));
+                sumi = _mm512_dpbusd_epi32(sumi, v[6], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_CCCC));
+                sumi = _mm512_dpbusd_epi32(sumi, v[7], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_DDDD));
+                accd[base + iy] = _mm512_fmadd_ps(scale, _mm512_cvtepi32_ps(sumi), accd_val);
+            }
+        }
+    }
+
+    const int8_t * q4qs;
+    const __m128i * dptr;
+    const MM_LENI values = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)kvalues_mxfp4_unsigned));
+    const MM_LENI m4 = _mm512_set1_epi8(0xf);
+    const MM_LENI m1 = _mm512_set1_epi32(1);
+    const MM_LENI zero  = _mm512_setzero_si512();
+    const MM_LENI val0  = _mm512_set1_epi32(0x00200000);
+    const MM_LENI val1  = _mm512_set1_epi32(0x00400000);
+};
+#else
+#define MM_LEN      __m256
+#define MM_LENI     __m256i
+#define MM_SET1F32  _mm256_set1_ps
+#define MM_SET1I32  _mm256_set1_epi32
+
+struct ZykQ4_0_T {
+    // nx: the total rows of weight matrix (aka, colunm size)
+    // ix: the start row of current process splited weight matrix
+    ZykQ4_0_T(const void * vx, size_t nb, size_t nx, size_t ix) {
+        q4qs = (const int8_t *)vx + sizeof(ggml_half)*nb*nx + 16*nb*ix; // every block contains 16 bytes qs
+        dptr = (const ggml_half *)vx + nb*ix;
+    }
+
+    template <int nrc_y>
+    inline void compute_block(const int8_t ** q8, MM_LEN * q8_d, MM_LENI * q8_s, MM_LEN * accd, int nrc_x) {
         __m256i q8qs[2*nrc_y];
         for (int iy = 0; iy < nrc_y; ++iy) {
             auto y = _mm256_loadu_si256((const __m256i*)q8[iy]);
@@ -195,15 +339,15 @@ struct ZykQ4_0_T {
             q8qs[2*iy+1] = _mm256_permute2x128_si256(y, y, 0x11);
         }
 
-        __m256i v[8];
+        MM_LENI v[8];
         #pragma clang loop unroll_count(4)
         for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
             auto q4_d = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)dptr));
-            dptr += 8;
-            v[0] = _mm256_loadu_si256((const __m256i *)q4qs+0);
-            v[1] = _mm256_loadu_si256((const __m256i *)q4qs+1);
-            v[2] = _mm256_loadu_si256((const __m256i *)q4qs+2);
-            v[3] = _mm256_loadu_si256((const __m256i *)q4qs+3);
+            dptr += N32B;
+            v[0] = _mm256_loadu_si256((const MM_LENI *)q4qs+0);
+            v[1] = _mm256_loadu_si256((const MM_LENI *)q4qs+1);
+            v[2] = _mm256_loadu_si256((const MM_LENI *)q4qs+2);
+            v[3] = _mm256_loadu_si256((const MM_LENI *)q4qs+3);
             v[4] = _mm256_and_si256(_mm256_srli_epi16(v[0], 4), m4);
             v[0] = _mm256_and_si256(v[0], m4);
             v[5] = _mm256_and_si256(_mm256_srli_epi16(v[1], 4), m4);
@@ -212,7 +356,7 @@ struct ZykQ4_0_T {
             v[2] = _mm256_and_si256(v[2], m4);
             v[7] = _mm256_and_si256(_mm256_srli_epi16(v[3], 4), m4);
             v[3] = _mm256_and_si256(v[3], m4);
-            q4qs += 0x80;
+            q4qs += (16*N32B);
 
             // #pragma clang loop unroll(full)
             for (int iy = 0; iy < nrc_y; ++iy) {
@@ -233,7 +377,7 @@ struct ZykQ4_0_T {
 
     const int8_t * q4qs;
     const ggml_half * dptr;
-    const __m256i m4 = _mm256_set1_epi8(0xf);
+    const MM_LENI m4 = _mm256_set1_epi8(0xf);
 };
 
 struct Zyk_MXFP4_T {
@@ -241,21 +385,21 @@ struct Zyk_MXFP4_T {
     // ix: the start row of current process splited weight matrix
     Zyk_MXFP4_T(const void * vx, size_t nb, size_t nx, size_t ix) {
         q4qs = (const int8_t *)vx + nb*nx + 16*nb*ix; // every block contains 16 bytes qs
-        dptr = (const uint64_t *)vx + nb*ix/sizeof(uint64_t);
+        dptr = (const uint64_t *)vx + nb*ix/N32B;
     }
 
-    inline __m256 ggml_e8m0_to_fp32_x8(const __m128i* packed) {
-        __m256i x = _mm256_cvtepu8_epi32(_mm_loadl_epi64(packed));
-        __m256i result = _mm256_slli_epi32(_mm256_sub_epi32(x, m1), 23);
-        __m256i mask0 = _mm256_cmpeq_epi32(x, zero);
-        __m256i mask1 = _mm256_cmpeq_epi32(x, m1);
+    inline MM_LEN ggml_e8m0_to_fp32_x8(const __m128i* packed) {
+        MM_LENI x = _mm256_cvtepu8_epi32(_mm_loadl_epi64(packed));
+        MM_LENI result = _mm256_slli_epi32(_mm256_sub_epi32(x, m1), 23);
+        MM_LENI mask0 = _mm256_cmpeq_epi32(x, zero);
+        MM_LENI mask1 = _mm256_cmpeq_epi32(x, m1);
         result = _mm256_or_si256(result, _mm256_and_si256(mask1, val1));
         result = _mm256_blendv_epi8(result, val0, mask0);
         return _mm256_castsi256_ps(result);
     }
 
     template <int nrc_y>
-    inline void compute_block(const int8_t ** q8, __m256 * q8_d, __m256i * q8_s, __m256 * accd, int nrc_x) {
+    inline void compute_block(const int8_t ** q8, MM_LEN * q8_d, MM_LENI * q8_s, MM_LEN * accd, int nrc_x) {
         __m256i q8qs[2*nrc_y];
         for (int iy = 0; iy < nrc_y; ++iy) {
             auto y = _mm256_loadu_si256((const __m256i*)q8[iy]);
@@ -264,15 +408,15 @@ struct Zyk_MXFP4_T {
             q8qs[2*iy+1] = _mm256_permute2x128_si256(y, y, 0x11);
         }
 
-        __m256i v[8];
+        MM_LENI v[8];
         #pragma clang loop unroll_count(4)
         for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
             auto q4_d = ggml_e8m0_to_fp32_x8((const __m128i *) dptr);
             dptr += 1;
-            v[0] = _mm256_loadu_si256((const __m256i *)q4qs+0);
-            v[1] = _mm256_loadu_si256((const __m256i *)q4qs+1);
-            v[2] = _mm256_loadu_si256((const __m256i *)q4qs+2);
-            v[3] = _mm256_loadu_si256((const __m256i *)q4qs+3);
+            v[0] = _mm256_loadu_si256((const MM_LENI *)q4qs+0);
+            v[1] = _mm256_loadu_si256((const MM_LENI *)q4qs+1);
+            v[2] = _mm256_loadu_si256((const MM_LENI *)q4qs+2);
+            v[3] = _mm256_loadu_si256((const MM_LENI *)q4qs+3);
             v[4] = _mm256_shuffle_epi8(values, _mm256_and_si256(_mm256_srli_epi16(v[0], 4), m4));
             v[0] = _mm256_shuffle_epi8(values, _mm256_and_si256(v[0], m4));
             v[5] = _mm256_shuffle_epi8(values, _mm256_and_si256(_mm256_srli_epi16(v[1], 4), m4));
@@ -281,7 +425,7 @@ struct Zyk_MXFP4_T {
             v[2] = _mm256_shuffle_epi8(values, _mm256_and_si256(v[2], m4));
             v[7] = _mm256_shuffle_epi8(values, _mm256_and_si256(_mm256_srli_epi16(v[3], 4), m4));
             v[3] = _mm256_shuffle_epi8(values, _mm256_and_si256(v[3], m4));
-            q4qs += 0x80;
+            q4qs += (16*N32B);
 
             // #pragma clang loop unroll(full)
             for (int iy = 0; iy < nrc_y; ++iy) {
@@ -302,19 +446,16 @@ struct Zyk_MXFP4_T {
 
     const int8_t * q4qs;
     const uint64_t * dptr;
-    const __m256i values = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kvalues_mxfp4_unsigned));
-    const __m256i m4 = _mm256_set1_epi8(0xf);
-    const __m256i m1 = _mm256_set1_epi32(1);
-    const __m256i zero  = _mm256_setzero_si256();
-    const __m256i val0  = _mm256_set1_epi32(0x00200000);
-    const __m256i val1  = _mm256_set1_epi32(0x00400000);
+    const MM_LENI values = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kvalues_mxfp4_unsigned));
+    const MM_LENI m4 = _mm256_set1_epi8(0xf);
+    const MM_LENI m1 = _mm256_set1_epi32(1);
+    const MM_LENI zero  = _mm256_setzero_si256();
+    const MM_LENI val0  = _mm256_set1_epi32(0x00200000);
+    const MM_LENI val1  = _mm256_set1_epi32(0x00400000);
 };
-
-#ifdef HAVE_FANCY_SIMD
-template __m512* thread_local_work_buffer<__m512>(size_t);
-#else
-template __m256* thread_local_work_buffer<__m256>(size_t);
 #endif
+
+template MM_LEN* thread_local_work_buffer<MM_LEN>(size_t);
 
 template <typename Dequantizer, int min_value, int nrc_y>
 static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo* info, int nrc_x) {
@@ -327,11 +468,11 @@ static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo*
 
     float d8[4*nrc_y];
     int32_t s8[4*nrc_y];
-    __m256 q8_d[nrc_y];
-    __m256i q8_s[nrc_y];
-    Dequantizer deq(vx, nb, info->bs, ix);
+    MM_LEN q8_d[nrc_y];
+    MM_LENI q8_s[nrc_y];
     // Initialize accumulation vector to zero
-    __m256 * accd = thread_local_work_buffer<__m256>(nrc_y * nrc_x);
+    MM_LEN * accd = thread_local_work_buffer<MM_LEN>(nrc_y * nrc_x);
+    Dequantizer deq(vx, nb, info->bs, ix);
     for (size_t ib4 = 0; ib4 < nb/4; ++ib4) {
         for (int iy = 0; iy < nrc_y; ++iy) {
             const __m128i scales_vec = _mm_loadu_si128((const __m128i *)q8[iy]);
@@ -344,8 +485,8 @@ static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo*
         // #pragma clang loop unroll(full)
         for (int k = 0; k < 4; ++k) {
             for (int iy = 0; iy < nrc_y; ++iy) {
-                q8_d[iy] = _mm256_set1_ps(d8[4*iy+k]);
-                q8_s[iy] = _mm256_set1_epi32(s8[4*iy+k]);
+                q8_d[iy] = MM_SET1F32(d8[4*iy+k]);
+                q8_s[iy] = MM_SET1I32(s8[4*iy+k]);
             }
             deq.template compute_block<nrc_y>(q8, q8_d, q8_s, accd, nrc_x);
         }
@@ -353,8 +494,8 @@ static void mul_mat_q4_t_q8_0(int n, const void * vx, size_t ix, const DataInfo*
     for (size_t ib = 4*(nb/4); ib < nb; ++ib) {
         for (int iy = 0; iy < nrc_y; ++iy) {
             auto qy = (const block_q8_2 *) q8[iy];
-            q8_d[iy] = _mm256_set1_ps(GGML_BF16_TO_FP32(ggml_bf16_t{qy->d}));
-            q8_s[iy] = _mm256_set1_epi32(min_value*qy->s);
+            q8_d[iy] = MM_SET1F32(GGML_BF16_TO_FP32(ggml_bf16_t{qy->d}));
+            q8_s[iy] = MM_SET1I32(min_value*qy->s);
             q8[iy] += 4;
         }
         deq.template compute_block<nrc_y>(q8, q8_d, q8_s, accd, nrc_x);
