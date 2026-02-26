@@ -202,7 +202,7 @@ struct ZykQ4_0_T {
         }
 
         MM_LENI v[8];
-        #pragma clang loop unroll_count(4)
+        // #pragma clang loop unroll_count(4)
         for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
             auto q4_d = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)dptr));
             dptr += N32B;
@@ -222,17 +222,17 @@ struct ZykQ4_0_T {
 
             // #pragma clang loop unroll(full)
             for (int iy = 0; iy < nrc_y; ++iy) {
-                auto sumi = _mm512_dpbusd_epi32(q8_s[iy], v[0], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_AAAA));
+                auto s0 = _mm512_dpbusd_epi32(q8_s[iy], v[0], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_AAAA));
+                auto s1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), v[1], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_BBBB));
                 auto scale = _mm512_mul_ps(q4_d, q8_d[iy]);
-                sumi = _mm512_dpbusd_epi32(sumi, v[1], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_BBBB));
-                sumi = _mm512_dpbusd_epi32(sumi, v[2], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_CCCC));
-                sumi = _mm512_dpbusd_epi32(sumi, v[3], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_DDDD));
+                s0 = _mm512_dpbusd_epi32(s0, v[2], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_CCCC));
+                s1 = _mm512_dpbusd_epi32(s1, v[3], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_DDDD));
                 auto accd_val = accd[base + iy];
-                sumi = _mm512_dpbusd_epi32(sumi, v[4], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_AAAA));
-                sumi = _mm512_dpbusd_epi32(sumi, v[5], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_BBBB));
-                sumi = _mm512_dpbusd_epi32(sumi, v[6], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_CCCC));
-                sumi = _mm512_dpbusd_epi32(sumi, v[7], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_DDDD));
-                accd[base + iy] = _mm512_fmadd_ps(scale, _mm512_cvtepi32_ps(sumi), accd_val);
+                s0 = _mm512_dpbusd_epi32(s0, v[4], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_AAAA));
+                s1 = _mm512_dpbusd_epi32(s1, v[5], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_BBBB));
+                s0 = _mm512_dpbusd_epi32(s0, v[6], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_CCCC));
+                s1 = _mm512_dpbusd_epi32(s1, v[7], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_DDDD));
+                accd[base + iy] = _mm512_fmadd_ps(scale, _mm512_cvtepi32_ps(_mm512_add_epi32(s0, s1)), accd_val);
             }
         }
     }
@@ -271,7 +271,7 @@ struct Zyk_MXFP4_T {
         }
 
         MM_LENI v[8];
-        #pragma clang loop unroll_count(4)
+        // #pragma clang loop unroll_count(4)
         for (int base = 0; base < nrc_y * nrc_x; base += nrc_y) {
             auto q4_d = ggml_e8m0_to_fp32_x16(dptr);
             dptr += 1;
@@ -291,17 +291,17 @@ struct Zyk_MXFP4_T {
 
             // #pragma clang loop unroll(full)
             for (int iy = 0; iy < nrc_y; ++iy) {
-                auto sumi = _mm512_dpbusd_epi32(q8_s[iy], v[0], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_AAAA));
+                auto s0 = _mm512_dpbusd_epi32(q8_s[iy], v[0], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_AAAA));
+                auto s1 = _mm512_dpbusd_epi32(zero, v[1], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_BBBB));
                 auto scale = _mm512_mul_ps(q4_d, q8_d[iy]);
-                sumi = _mm512_dpbusd_epi32(sumi, v[1], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_BBBB));
-                sumi = _mm512_dpbusd_epi32(sumi, v[2], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_CCCC));
-                sumi = _mm512_dpbusd_epi32(sumi, v[3], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_DDDD));
+                s0 = _mm512_dpbusd_epi32(s0, v[2], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_CCCC));
+                s1 = _mm512_dpbusd_epi32(s1, v[3], _mm512_shuffle_epi32(q8qs[2*iy], _MM_PERM_DDDD));
                 auto accd_val = accd[base + iy];
-                sumi = _mm512_dpbusd_epi32(sumi, v[4], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_AAAA));
-                sumi = _mm512_dpbusd_epi32(sumi, v[5], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_BBBB));
-                sumi = _mm512_dpbusd_epi32(sumi, v[6], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_CCCC));
-                sumi = _mm512_dpbusd_epi32(sumi, v[7], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_DDDD));
-                accd[base + iy] = _mm512_fmadd_ps(scale, _mm512_cvtepi32_ps(sumi), accd_val);
+                s0 = _mm512_dpbusd_epi32(s0, v[4], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_AAAA));
+                s1 = _mm512_dpbusd_epi32(s1, v[5], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_BBBB));
+                s0 = _mm512_dpbusd_epi32(s0, v[6], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_CCCC));
+                s1 = _mm512_dpbusd_epi32(s1, v[7], _mm512_shuffle_epi32(q8qs[2*iy+1], _MM_PERM_DDDD));
+                accd[base + iy] = _mm512_fmadd_ps(scale, _mm512_cvtepi32_ps(_mm512_add_epi32(s0, s1)), accd_val);
             }
         }
     }
