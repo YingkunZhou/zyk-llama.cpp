@@ -132,6 +132,7 @@ ln -sf $ORT_DIR/lib/libonnxruntime.so.1.25.0 libonnxruntime.so
 ### AARCH64 Android (Termux)
 
 ```bash
+pip install requests
 tar xf onnxruntime.tar.gz
 cd onnxruntime
 ln -sf include headers
@@ -164,10 +165,13 @@ cp onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2 lib/libonnxruntime.
 # 编译 benchmark tool
 
 ```bash
+cd engines/onnxruntime
 mkdir build && cd build
 cmake .. -DOGA_DIR=$OGA_DIR -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
+
+[gemma-3-4b-onnx](https://huggingface.co/onnxruntime/Gemma-3-ONNX/tree/main/gemma-3-4b-it/cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4)
 
 ```json
 $ head -n 20 ~/gemma-3-4b-onnx/genai_config.json
@@ -186,8 +190,13 @@ $ head -n 20 ~/gemma-3-4b-onnx/genai_config.json
 ```
 
 # 运行 benchmark
+
+```bash
 ./model_bench -m ~/gemma-3-4b-onnx -e cpu --bench --pp 8 128 512 --tg 128 --reps 5
+./model_bench -m ~/gemma-3-4b-onnx -e cpu --bench --pp 1 2 3 4 5 6 7 8 --tg 0 --reps 3
+./model_bench -m ~/gemma-3-4b-onnx -e cpu --bench --pp 1 2 3 4 5 6 7 8 --tg 32 --reps 3
 
 # 正常推理
 ./model_bench -m ~/gemma-3-4b-onnx -e cpu -p "Hello, who are you?"
+```
 
