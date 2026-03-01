@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Option 2: the headers/libs are in standard system paths
 
 if(DEFINED OGA_DIR)
-    set(OGA_INCLUDE_DIR "${OGA_DIR}/src")
+    set(OGA_INCLUDE_DIR "${OGA_DIR}/include")
     if(WIN32)
         set(OGA_LIB_DIR "${OGA_DIR}/lib")
         set(OGA_LIB "onnxruntime-genai")
