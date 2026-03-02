@@ -63,3 +63,13 @@ make -j$(nproc)
 ./ov_bench -m ~/gemma-3-4b-it-qat-q4_0-ov -d CPU --pp 2 3 4 5 6 7 8 --tg 32 --warmup 1 --iters 3 --mode separate --threads 4
 ./ov_bench -m ~/gemma-3-4b-it-qat-q4_0-ov -d GPU --pp 2 3 4 5 6 7 8 --tg 32 --warmup 1 --iters 3 --mode separate
 ```
+
+```
+python bench_vlm.py \
+  -m ~/gemma-3-4b-it-int4-cw-ov \
+  -d NPU \
+  --pp 2 3 4 5 6 7 8 \
+  --tg 32 \
+  --warmup 1 --iters 3 \
+  --mode separate
+```
