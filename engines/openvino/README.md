@@ -64,7 +64,23 @@ make -j$(nproc)
 ./ov_bench -m ~/gemma-3-4b-it-qat-q4_0-ov -d GPU --pp 2 3 4 5 6 7 8 --tg 32 --warmup 1 --iters 3 --mode separate
 ```
 
+# run for lunarlake's NPU
+
+```bash
+pip install openvino openvino-genai openvino-tokenizers --upgrade # >=26的版本
+sudo snap install intel-npu-driver
+sudo reboot
 ```
+
+```python
+import huggingface_hub as hf_hub
+model_id = "OpenVINO/gemma-3-4b-it-int4-cw-ov"
+model_path = "gemma-3-4b-it-int4-cw-ov"
+hf_hub.snapshot_download(model_id, local_dir=model_path)
+```
+
+```bash
+export LD_LIBRARY_PATH=/snap/intel-npu-driver/19/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 python bench_vlm.py \
   -m ~/gemma-3-4b-it-int4-cw-ov \
   -d NPU \

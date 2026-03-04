@@ -1,0 +1,113 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "gemma3-base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/../../../cmake-out/examples/models/gemma3",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_FIND_ROOT_PATH": "${sourceDir}/../../../cmake-out"
+            }
+        },
+        {
+            "name": "gemma3-cpu",
+            "displayName": "Gemma3 runner (CPU)",
+            "inherits": ["gemma3-base"]
+        },
+        {
+            "name": "gemma3-cuda",
+            "displayName": "Gemma3 runner (CUDA)",
+            "inherits": ["gemma3-base"],
+            "cacheVariables": {
+                "EXECUTORCH_BUILD_CUDA": "ON"
+            },
+            "condition": {
+                "lhs": "${hostSystemName}",
+                "type": "equals",
+                "rhs": "Linux"
+            }
+        },
+        {
+            "name": "gemma3-android-arm64",
+            "displayName": "Gemma3 runner (Android arm64-v8a)",
+            "inherits": ["gemma3-base"],
+            "binaryDir": "${sourceDir}/../../../cmake-out-android-arm64-v8a/examples/models/gemma3",
+            "cacheVariables": {
+                "CMAKE_FIND_ROOT_PATH": "${sourceDir}/../../../cmake-out-android-arm64-v8a",
+                "CMAKE_TOOLCHAIN_FILE": "$env{ANDROID_NDK}/build/cmake/android.toolchain.cmake",
+                "ANDROID_ABI": "arm64-v8a",
+                "ANDROID_PLATFORM": "android-30"
+            },
+            "condition": {
+                "type": "inList",
+                "string": "${hostSystemName}",
+                "list": ["Darwin", "Linux"]
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "gemma3-cpu",
+            "displayName": "Build Gemma3 runner (CPU)",
+            "configurePreset": "gemma3-cpu",
+            "targets": ["gemma3_e2e_runner"]
+        },
+        {
+            "name": "gemma3-cuda",
+            "displayName": "Build Gemma3 runner (CUDA)",
+            "configurePreset": "gemma3-cuda",
+            "targets": ["gemma3_e2e_runner"]
+        },
+        {
+            "name": "gemma3-android-arm64",
+            "displayName": "Build Gemma3 runner (Android arm64-v8a)",
+            "configurePreset": "gemma3-android-arm64",
+            "targets": ["gemma3_e2e_runner"]
+        }
+    ],
+    "workflowPresets": [
+        {
+            "name": "gemma3-cpu",
+            "displayName": "Configure and build Gemma3 runner (CPU)",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "gemma3-cpu"
+                },
+                {
+                    "type": "build",
+                    "name": "gemma3-cpu"
+                }
+            ]
+        },
+        {
+            "name": "gemma3-cuda",
+            "displayName": "Configure and build Gemma3 runner (CUDA)",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "gemma3-cuda"
+                },
+                {
+                    "type": "build",
+                    "name": "gemma3-cuda"
+                }
+            ]
+        },
+        {
+            "name": "gemma3-android-arm64",
+            "displayName": "Configure and build Gemma3 runner (Android arm64-v8a)",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "gemma3-android-arm64"
+                },
+                {
+                    "type": "build",
+                    "name": "gemma3-android-arm64"
+                }
+            ]
+        }
+    ]
+}
