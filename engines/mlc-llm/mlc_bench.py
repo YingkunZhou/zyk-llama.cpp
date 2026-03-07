@@ -466,17 +466,15 @@ def main() -> None:
     if args.prompt is not None:
         print(f"\n{BOLD}Q: {args.prompt}{RESET}\n")
         print(f"{CYAN}A: {RESET}", end="", flush=True)
-        for resp in engine.completions.create(
-            prompt      = args.prompt,
-            model       = args.model,
-            max_tokens  = 512,
-            stream      = True,
-            temperature = 0.7,
+        for response in engine.chat.completions.create(
+            messages=[{"role": "user", "content": args.prompt}],
+            model=args.model,
+            stream=True,
         ):
-            for choice in resp.choices:
-                if choice.text:
-                    print(choice.text, end="", flush=True)
+            for choice in response.choices:
+                print(choice.delta.content, end="", flush=True)
         print()
+
         engine.terminate()
         return
 
