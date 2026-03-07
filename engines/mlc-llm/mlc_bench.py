@@ -397,6 +397,8 @@ def main() -> None:
     parser.add_argument("--skip-pp",        action="store_true")
     parser.add_argument("--skip-tg",        action="store_true")
     parser.add_argument("--verbose",        action="store_true")
+    parser.add_argument("--prompt",         default=None, metavar="TEXT",
+                        help="直接提问并输出回答，不跑 benchmark")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -457,6 +459,27 @@ def main() -> None:
     # ------------------------------------------------------------------
     if args.threads is not None:
         apply_thread_api(args.threads, verbose=True)
+
+    # ------------------------------------------------------------------
+    # PROMPT MODE: 直接问答，不跑 benchmark
+    # ------------------------------------------------------------------
+    if args.prompt is not None:
+        print(f"\n{BOLD}Q: {args.prompt}{RESET}\n")
+        print(f"{CYAN}A: {RESET}", end="", flush=True)
+        for resp in engine.completions.create(
+            prompt      = args.prompt,
+            model       = args.model,
+            max_tokens  = 512,
+            stream      = True,
+            temperature = 0.7,
+        ):
+            for choice in resp.choices:
+                if choice.text:
+                    print(choice.text, end="", flush=True)
+        print()
+        engine.terminate()
+        return
+
 
     # ------------------------------------------------------------------
     # STEP 7: resolve tokenizer
